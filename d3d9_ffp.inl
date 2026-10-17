@@ -69,7 +69,7 @@ struct FFPProgram {
     GLint mdiff, mamb, mspec, memis, mpower, gamb;
     GLint lpos, ldir, ldiff, lspec, lamb, latt, lspot;
     GLint texmat[FFP_MAX_STAGES];
-    GLint tfactor, alpharef, fog, fogcolor, clipplane;
+    GLint tfactor, alpharef, fog, fogcolor, clipplane, lodbias;
 };
 
 static std::map<std::string, FFPProgram*> g_ffp_programs;
@@ -336,7 +336,7 @@ static std::string FFP_Op(int op, const std::string& a0, const std::string& a1, 
 static std::string FFP_GenFS(const FFPKey& k) {
     std::string s = "#version 300 es\nprecision highp float;\n";
     s += "in vec4 v_diffuse, v_specular;\nin float v_fog, v_clipdist;\n"
-         "uniform vec4 u_tfactor;\nuniform float u_alpharef;\nuniform vec3 u_fogcolor;\nuniform vec4 u_fog;\n"
+         "uniform vec4 u_tfactor;\nuniform float u_alpharef;\nuniform vec3 u_fogcolor;\nuniform vec4 u_fog;\nuniform float u_lodbias[4];\n"
          "out vec4 o_color;\n";
     for (int i = 0; i < k.stage_count; i++) {
         s += "in vec4 v_tc" + FFP_Itos(i) + ";\n";
@@ -354,7 +354,7 @@ static std::string FFP_GenFS(const FFPKey& k) {
                 int c = st.ttff ? st.ttff - 1 : 3;
                 uv = tc + ".xy / " + tc + "." + "xyzw"[c];
             }
-            s += "  vec4 t" + n + " = texture(u_tex" + n + ", " + uv + ");\n";
+            s += "  vec4 t" + n + " = texture(u_tex" + n + ", " + uv + ", u_lodbias[" + n + "]);\n";
         } else {
             s += "  vec4 t" + n + " = vec4(1.0);\n";
         }
@@ -467,6 +467,7 @@ static FFPProgram* FFP_GetProgram(const FFPKey& k) {
     p->fog = glGetUniformLocation(pr, "u_fog");
     p->fogcolor = glGetUniformLocation(pr, "u_fogcolor");
     p->clipplane = glGetUniformLocation(pr, "u_clipplane");
+    p->lodbias = glGetUniformLocation(pr, "u_lodbias");
     glUseProgram(pr);
     g_ffp_current_program = pr;
     for (int i = 0; i < FFP_MAX_STAGES; i++) {
@@ -678,6 +679,13 @@ static void FFP_Prepare(const FFPDrawContext& c, float vp_x, float vp_y, float v
     }
 
     // texture stages
+    if (p->lodbias != -1) {
+        // D3DSAMP_MIPMAPLODBIAS; WebGL selects coarser mip levels than D3D9
+        // drivers for the same texture, which the extra -0.75 makes up for
+        float bias[FFP_MAX_STAGES];
+        for (int i = 0; i < FFP_MAX_STAGES; i++) bias[i] = FFP_DwordFloat(g_sampler_states[i][D3DSAMP_MIPMAPLODBIAS]) - 0.75f;
+        glUniform1fv(p->lodbias, FFP_MAX_STAGES, bias);
+    }
     for (int i = 0; i < k.stage_count; i++) {
         if (k.stage[i].ttff && p->texmat[i] != -1)
             glUniformMatrix4fv(p->texmat[i], 1, GL_FALSE, &g_texture_matrices[i].m[0][0]);
