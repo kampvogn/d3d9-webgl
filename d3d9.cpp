@@ -316,6 +316,25 @@ public:
     void* m_locked_data;
     
 public:
+    // levels == 0 asks for the whole mipmap chain, as in D3D9
+    virtual DWORD GetLevelCount() override {
+        if (m_levels) return m_levels;
+        DWORD n = 1;
+        for (UINT s = (m_width > m_height ? m_width : m_height); s > 1; s >>= 1) n++;
+        return n;
+    }
+
+    virtual HRESULT GetLevelDesc(UINT Level, D3DSURFACE_DESC* pDesc) override {
+        if (!pDesc || Level >= GetLevelCount()) return D3DERR_INVALIDCALL;
+        memset(pDesc, 0, sizeof(*pDesc));
+        pDesc->Format = m_format;
+        pDesc->Type = D3DRTYPE_TEXTURE;
+        pDesc->Pool = D3DPOOL_MANAGED;
+        pDesc->Width = (m_width >> Level) ? (m_width >> Level) : 1;
+        pDesc->Height = (m_height >> Level) ? (m_height >> Level) : 1;
+        return D3D_OK;
+    }
+
     D3D9Texture(UINT width, UINT height, UINT levels, D3DFORMAT format)
         : m_width(width), m_height(height), m_levels(levels), m_format(format), m_locked_data(nullptr) {
         glGenTextures(1, &m_texture);
