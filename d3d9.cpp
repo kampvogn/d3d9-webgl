@@ -528,7 +528,7 @@ void EnsureUPBuffers() {
 void CheckGLError(const char* label) {
     GLenum err = glGetError();
     while (err != GL_NO_ERROR) {
-        // Silently consume errors
+        printf("GL error 0x%x after %s\n", err, label);
         err = glGetError();
     }
 }
@@ -740,6 +740,39 @@ static void SetFFPLightingUniforms(const D3DMATRIX* world, const DWORD* render_s
 
 // Global FBO for SetRenderTarget
 static GLuint g_fbo = 0;
+static inline bool getenv_nolight() {
+#ifdef DBG_NOLIGHT
+    return true;
+#else
+    return false;
+#endif
+}
+#ifdef DEBUG_TEXTURE_TEST
+static int g_dbg_frame = 0;
+EM_JS(void, glGetBufferSubData, (GLenum target, long offset, long size, void* data), {
+    GLctx.getBufferSubData(target, offset, HEAPU8.subarray(data, data + size));
+});
+#endif
+// Colour-only framebuffers for StretchRect and ColorFill, so they leave g_fbo
+// (the render target with its depth buffer) alone
+static GLuint g_fbo_read = 0, g_fbo_aux = 0;
+
+// D3D9 lets a depth surface be larger than the render target (one big Z buffer
+// shared by all render targets is common); WebGL refuses framebuffers whose
+// attachments differ in size. Render targets of another size than the depth
+// surface get a depth buffer of their own size from here, one per size.
+static std::map<std::pair<UINT, UINT>, GLuint> g_depth_for_size;
+
+static GLuint DepthBufferForSize(UINT w, UINT h) {
+    GLuint& rb = g_depth_for_size[std::make_pair(w, h)];
+    if (!rb) {
+        glGenRenderbuffers(1, &rb);
+        glBindRenderbuffer(GL_RENDERBUFFER, rb);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    }
+    return rb;
+}
 
 // D3D9Surface class
 class D3D9Surface : public IDirect3DSurface9 {
@@ -1172,6 +1205,8 @@ public:
 };
 
 // Implementation classes
+#include "d3d9_ffp.inl"
+
 class D3D9Device : public IDirect3DDevice9 {
 private:
     D3DMATRIX m_world;
@@ -1181,6 +1216,7 @@ private:
     D3DFORMAT m_current_ib_format;
     GLuint m_current_vertex_buffer;
     UINT m_current_stride;
+    UINT m_stream_offset = 0;
     
     D3D9Surface* m_backbuffer_surface;
     D3D9Surface* m_current_rt;
@@ -1224,12 +1260,15 @@ public:
         g_viewport.MaxZ = 1.0f;
 
         if (g_fbo == 0) glGenFramebuffers(1, &g_fbo);
+        if (g_fbo_read == 0) glGenFramebuffers(1, &g_fbo_read);
+        if (g_fbo_aux == 0) glGenFramebuffers(1, &g_fbo_aux);
 
         m_scissor_rect = {0, 0, (LONG)g_logical_width, (LONG)g_logical_height};
 
         // Backbuffer surface matches the app's backbuffer resolution
         m_backbuffer_surface = new D3D9Surface(g_logical_width, g_logical_height, 0, false, true);
         m_current_rt = m_backbuffer_surface;
+        m_current_rt->AddRef(); // held as the current render target
         m_current_ds = nullptr; // Default DS is implicit in WebGL context
         
         // Initialize matrices to identity
@@ -1254,9 +1293,14 @@ public:
                 g_texture_stage_states[i][D3DTSS_ALPHAOP] = D3DTOP_DISABLE;
             }
             g_texture_stage_states[i][D3DTSS_COLORARG1] = D3DTA_TEXTURE;
-            g_texture_stage_states[i][D3DTSS_COLORARG2] = D3DTA_DIFFUSE;
+            g_texture_stage_states[i][D3DTSS_COLORARG2] = D3DTA_CURRENT;
             g_texture_stage_states[i][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
-            g_texture_stage_states[i][D3DTSS_ALPHAARG2] = D3DTA_DIFFUSE;
+            g_texture_stage_states[i][D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+            g_texture_stage_states[i][D3DTSS_COLORARG0] = D3DTA_CURRENT;
+            g_texture_stage_states[i][D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
+            g_texture_stage_states[i][D3DTSS_RESULTARG] = D3DTA_CURRENT;
+            g_texture_stage_states[i][D3DTSS_TEXCOORDINDEX] = i;
+            g_texture_stage_states[i][D3DTSS_TEXTURETRANSFORMFLAGS] = D3DTTFF_DISABLE;
         }
 
         // Initialize state
@@ -1271,6 +1315,28 @@ public:
         m_render_states[D3DRS_ZWRITEENABLE]     = TRUE;             // D3D9 default: depth write enabled
         m_render_states[D3DRS_COLORWRITEENABLE] = 0x0000000F;       // D3D9 default: all channels (R|G|B|A)
         m_render_states[D3DRS_ZFUNC]            = D3DCMP_LESSEQUAL; // D3D9 default: LESSEQUAL (not GL's LESS)
+        m_render_states[D3DRS_ZENABLE]          = TRUE;
+        m_render_states[D3DRS_SHADEMODE]        = D3DSHADE_GOURAUD;
+        m_render_states[D3DRS_CULLMODE]         = D3DCULL_CCW;
+        m_render_states[D3DRS_SRCBLEND]         = D3DBLEND_ONE;
+        m_render_states[D3DRS_DESTBLEND]        = D3DBLEND_ZERO;
+        m_render_states[D3DRS_BLENDOP]          = D3DBLENDOP_ADD;
+        m_render_states[D3DRS_ALPHAFUNC]        = D3DCMP_ALWAYS;
+        m_render_states[D3DRS_TEXTUREFACTOR]    = 0xFFFFFFFF;
+        m_render_states[D3DRS_COLORVERTEX]      = TRUE;
+        m_render_states[D3DRS_LOCALVIEWER]      = TRUE;
+        m_render_states[D3DRS_DIFFUSEMATERIALSOURCE]  = 1; // D3DMCS_COLOR1
+        m_render_states[D3DRS_SPECULARMATERIALSOURCE] = 2; // D3DMCS_COLOR2
+        m_render_states[D3DRS_CLIPPING]         = TRUE;
+        m_render_states[D3DRS_STENCILFUNC]      = D3DCMP_ALWAYS;
+        m_render_states[D3DRS_STENCILFAIL]      = D3DSTENCILOP_KEEP;
+        m_render_states[D3DRS_STENCILZFAIL]     = D3DSTENCILOP_KEEP;
+        m_render_states[D3DRS_STENCILPASS]      = D3DSTENCILOP_KEEP;
+        m_render_states[D3DRS_STENCILMASK]      = 0xFFFFFFFF;
+        m_render_states[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFF;
+        float one = 1.0f;
+        memcpy(&m_render_states[D3DRS_FOGEND], &one, 4);
+        memcpy(&m_render_states[D3DRS_FOGDENSITY], &one, 4);
 
         // Initial viewport call
         SetViewport(&g_viewport);
@@ -1284,8 +1350,9 @@ public:
         // OpenGL uses CCW by default (right-handed), so we flip it
         glFrontFace(GL_CW);
 
-        // Disable culling initially (will be set via SetRenderState)
-        glDisable(GL_CULL_FACE);
+        // D3D9 default: cull counter-clockwise (back) faces
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
     }
     
     virtual ~D3D9Device() {
@@ -1294,6 +1361,9 @@ public:
             m_backbuffer_surface->Release();
             m_backbuffer_surface = nullptr;
         }
+        // The device holds a reference to its render target and depth surface
+        if (m_current_rt) m_current_rt->Release();
+        if (m_current_ds) m_current_ds->Release();
         m_current_rt = nullptr;
         m_current_ds = nullptr;
 
@@ -1339,10 +1409,145 @@ public:
         return D3D_OK;
     }
     
+    // Attach the depth surface to g_fbo (bound) for the current render target
+    void AttachDepthToFbo() {
+        GLuint rb = 0;
+        if (m_current_ds && m_current_rt) {
+            rb = m_current_ds->m_gl_object;
+            if (m_current_ds->m_width != m_current_rt->m_width || m_current_ds->m_height != m_current_rt->m_height)
+                rb = DepthBufferForSize(m_current_rt->m_width, m_current_rt->m_height);
+        }
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rb);
+    }
+
+    // Everything a draw needs before glDraw*: program, uniforms, textures, winding
+    void PrepareDraw() {
+        FFPDrawContext c;
+        c.fvf = g_current_fvf;
+        c.rs = m_render_states;
+        c.world = &m_world;
+        c.view = &m_view;
+        c.proj = &m_projection;
+        c.fbo = m_fbo_rendering;
+        c.render_target = (m_fbo_rendering && m_current_rt) ? m_current_rt->m_gl_object : 0;
+        c.clip_enabled = m_clip_plane_enabled;
+        c.clip_plane = m_clip_planes[0];
+        // D3D9 keeps clockwise triangles (as seen on screen); a render target
+        // is stored upside down, which turns them counter-clockwise
+        glFrontFace(m_fbo_rendering ? GL_CCW : GL_CW);
+#ifdef DBG_NOCULL
+        glDisable(GL_CULL_FACE);
+#endif
+#ifdef DBG_NOZ
+        glDisable(GL_DEPTH_TEST);
+#endif
+        FFP_Prepare(c, (float)g_viewport.X, (float)g_viewport.Y, (float)g_viewport.Width, (float)g_viewport.Height);
+#ifdef DEBUG_TEXTURE_TEST
+        if (g_dbg_frame == 200) {
+            FFPKey k; GLuint st[4];
+            FFP_BuildKey(c, k, st);
+            printf("[ffp] rt %u fvf %x light %d spec %d src %d%d%d%d lights %d%d%d%d stages %d fog %d atest %d | blend %u %u/%u z %u/%u cull %u\n",
+                c.render_target, c.fvf, k.lighting, k.specular, k.mat_src[0], k.mat_src[1], k.mat_src[2], k.mat_src[3],
+                k.light_type[0], k.light_type[1], k.light_type[2], k.light_type[3], k.stage_count, k.fog, k.alpha_func,
+                m_render_states[D3DRS_ALPHABLENDENABLE], m_render_states[D3DRS_SRCBLEND], m_render_states[D3DRS_DESTBLEND],
+                m_render_states[D3DRS_ZENABLE], m_render_states[D3DRS_ZFUNC], m_render_states[D3DRS_CULLMODE]);
+            for (int i = 0; i < k.stage_count; i++) if (st[i]) {
+                GLint prev = 0; glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo_read);
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, st[i], 0);
+                unsigned char px[16*16*4]; double ch[4] = {0, 0, 0, 0};
+                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                for (int j = 0; j < 256; j++) for (int c = 0; c < 4; c++) ch[c] += px[j*4+c];
+                printf("[ffp]   tex%d %u rgba %.0f %.0f %.0f %.0f\n", i, st[i], ch[0]/256, ch[1]/256, ch[2]/256, ch[3]/256);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, prev);
+            }
+            for (int i = 0; i < k.stage_count; i++)
+                printf("[ffp]   stage %d tex %d op %d %x %x a %d %x %x tci %d/%d ttff %d\n", i, k.stage[i].has_texture, k.stage[i].colorop,
+                    k.stage[i].carg1, k.stage[i].carg2, k.stage[i].alphaop, k.stage[i].aarg1, k.stage[i].aarg2, k.stage[i].tc_index, k.stage[i].tc_gen, k.stage[i].ttff);
+            if (k.lighting) {
+                const D3DMATERIAL9& m = g_material;
+                printf("[ffp]   mat d %g %g %g %g a %g %g %g e %g %g %g s %g p %g amb %08x\n", m.Diffuse.r, m.Diffuse.g, m.Diffuse.b, m.Diffuse.a,
+                    m.Ambient.r, m.Ambient.g, m.Ambient.b, m.Emissive.r, m.Emissive.g, m.Emissive.b, m.Specular.r, m.Power, m_render_states[D3DRS_AMBIENT]);
+                for (int l = 0; l < 4; l++) if (k.light_type[l]) {
+                    const D3DLIGHT9& L = g_lights[l];
+                    printf("[ffp]   light %d type %d d %g %g %g a %g %g %g pos %g %g %g dir %g %g %g att %g %g %g range %g\n", l, L.Type,
+                        L.Diffuse.r, L.Diffuse.g, L.Diffuse.b, L.Ambient.r, L.Ambient.g, L.Ambient.b, L.Position.x, L.Position.y, L.Position.z,
+                        L.Direction.x, L.Direction.y, L.Direction.z, L.Attenuation0, L.Attenuation1, L.Attenuation2, L.Range);
+                }
+            }
+        }
+#endif
+    }
+
+    // The texture a stage may sample: none while it is also the render target.
+    // (D3D9 leaves that undefined and drivers tolerate it; WebGL refuses the draw
+    // with "Feedback loop formed between Framebuffer and active Texture".)
+    GLuint SamplableTexture(DWORD stage) const {
+        GLuint t = g_texture_stages[stage];
+        if (t && m_fbo_rendering && m_current_rt && t == m_current_rt->m_gl_object) return 0;
+        return t;
+    }
+
+    virtual HRESULT GetBackBuffer(UINT iSwapChain, UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface9** ppBackBuffer) override {
+        if (!ppBackBuffer || iSwapChain != 0 || iBackBuffer != 0) return D3DERR_INVALIDCALL;
+        *ppBackBuffer = m_backbuffer_surface;
+        m_backbuffer_surface->AddRef(); // Proper COM semantics: caller must Release
+        return D3D_OK;
+    }
+
+    // Fill a rectangle of a render target or the backbuffer with one colour
+    // (a scissored clear; render states such as the colour write mask do not apply).
+    virtual HRESULT ColorFill(IDirect3DSurface9* pSurface, const RECT* pRect, D3DCOLOR color) override {
+        D3D9Surface* surf = static_cast<D3D9Surface*>(pSurface);
+        if (!surf || surf->m_is_renderbuffer) return D3DERR_INVALIDCALL;
+        if (!surf->m_is_backbuffer && surf->m_gl_object == 0) return D3D_OK; // offscreen plain surface: no GL storage
+
+        if (surf->m_is_backbuffer) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        } else {
+            glBindFramebuffer(GL_FRAMEBUFFER, g_fbo_aux);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, surf->m_gl_object, 0);
+        }
+
+        RECT r = {0, 0, (LONG)surf->m_width, (LONG)surf->m_height};
+        if (pRect) r = *pRect;
+        // WebGL Y is bottom-to-top: flip Y origin (as SetScissorRect does)
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(r.left, surf->m_is_backbuffer ? (GLint)surf->m_height - r.bottom : r.top, r.right - r.left, r.bottom - r.top);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(((color >> 16) & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f,
+                     (color & 0xFF) / 255.0f, ((color >> 24) & 0xFF) / 255.0f);
+        CHECK_GL_ERROR(glClear(GL_COLOR_BUFFER_BIT));
+
+        // Restore scissor, colour mask and the current render target
+        glScissor(g_cached_scissor_box[0], g_cached_scissor_box[1], g_cached_scissor_box[2], g_cached_scissor_box[3]);
+        if (g_cached_scissor_test) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+        DWORD cw = m_render_states[D3DRS_COLORWRITEENABLE];
+        glColorMask((cw & D3DCOLORWRITEENABLE_RED) ? GL_TRUE : GL_FALSE, (cw & D3DCOLORWRITEENABLE_GREEN) ? GL_TRUE : GL_FALSE,
+                    (cw & D3DCOLORWRITEENABLE_BLUE) ? GL_TRUE : GL_FALSE, (cw & D3DCOLORWRITEENABLE_ALPHA) ? GL_TRUE : GL_FALSE);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_fbo_rendering ? g_fbo : 0);
+        return D3D_OK;
+    }
+
     virtual HRESULT SetRenderTarget(DWORD Index, IDirect3DSurface9* pRenderTarget) override {
         if (Index != 0 || !pRenderTarget) return D3DERR_INVALIDCALL;
 
         D3D9Surface* surf = static_cast<D3D9Surface*>(pRenderTarget);
+#ifdef DEBUG_TEXTURE_TEST
+        if (g_dbg_frame == 200 && m_fbo_rendering && m_current_rt) {
+            UINT w = m_current_rt->m_width, h = m_current_rt->m_height;
+            std::vector<unsigned char> px(w * h * 4);
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            unsigned lit = 0, sum = 0, a = 0; double ch[3] = {0, 0, 0};
+            for (UINT i = 0; i < w * h; i++) { unsigned v = px[i*4] + px[i*4+1] + px[i*4+2]; if (v > 8) lit++; sum += v; a += px[i*4+3]; for (int c = 0; c < 3; c++) ch[c] += px[i*4+c]; }
+            printf("[rt] leaving %u %ux%u: %u lit, mean %u, rgb %.0f %.0f %.0f alpha mean %u\n", m_current_rt->m_gl_object, w, h, lit, sum / (w*h),
+                ch[0] / (w*h), ch[1] / (w*h), ch[2] / (w*h), a / (w*h));
+        }
+#endif
+        // Like D3D9, the device keeps a reference: callers may Release the
+        // surface (e.g. one from GetSurfaceLevel) right after setting it.
+        surf->AddRef();
+        if (m_current_rt) m_current_rt->Release();
         m_current_rt = surf;
 
         if (surf->m_is_backbuffer) {
@@ -1351,6 +1556,8 @@ public:
         } else {
             glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, surf->m_gl_object, 0);
+            // the depth surface may have been set while the backbuffer was current
+            AttachDepthToFbo();
             m_fbo_rendering = true;
         }
         // Note: glFrontFace is set per draw call based on det(world*view) and Y-flip state,
@@ -1379,15 +1586,14 @@ public:
     
     virtual HRESULT SetDepthStencilSurface(IDirect3DSurface9* pZStencilSurface) override {
         // If backbuffer is active, we assume default DS. If FBO is active, we attach DS.
-        m_current_ds = static_cast<D3D9Surface*>(pZStencilSurface);
+        D3D9Surface* ds = static_cast<D3D9Surface*>(pZStencilSurface);
+        if (ds) ds->AddRef(); // held by the device, as in D3D9
+        if (m_current_ds) m_current_ds->Release();
+        m_current_ds = ds;
         
         if (!m_current_rt->m_is_backbuffer) {
             glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-            if (m_current_ds) {
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_current_ds->m_gl_object);
-            } else {
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
-            }
+            AttachDepthToFbo();
         }
         return D3D_OK;
     }
@@ -1419,197 +1625,14 @@ public:
     
     // Drawing methods
     virtual HRESULT DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) override {
-        // Non-indexed primitive drawing using hardware VB (used by cloth rendering)
-        if (m_current_vertex_buffer == 0) return -1;
-        if (g_shader_program == 0) init_shaders();
-        glUseProgram(g_shader_program);
-
-        // FBO Y-flip and clip plane uniforms
-        glUniform1i(g_fbo_flip_y_uniform, m_fbo_rendering ? 1 : 0);
-        glUniform1i(g_clip_plane_enabled_uniform, m_clip_plane_enabled ? 1 : 0);
-        if (m_clip_plane_enabled) glUniform4fv(g_clip_plane_uniform, 1, m_clip_planes[0]);
-
-        D3DMATRIX view_model, mvp;
-        if (g_current_fvf & D3DFVF_XYZRHW) {
-            float vw = (g_viewport.Width > 0) ? (float)g_viewport.Width : (float)g_logical_width;
-            float vh = (g_viewport.Height > 0) ? (float)g_viewport.Height : (float)g_logical_height;
-            memset(&mvp, 0, sizeof(D3DMATRIX));
-            mvp.m[0][0] = 2.0f / vw;
-            mvp.m[1][1] = -2.0f / vh;
-            mvp.m[2][2] = 1.0f;
-            mvp.m[3][0] = -1.0f;
-            mvp.m[3][1] = 1.0f;
-            mvp.m[3][3] = 1.0f;
-        } else {
-            matrix_multiply(&view_model, &m_world, &m_view);
-            matrix_multiply(&mvp, &view_model, &m_projection);
-        }
-
-        // D3D9 auto-detects mirrored transforms (negative determinant) and flips culling.
-        // WebGL doesn't, so we detect it per draw call. Y-flip also reverses winding.
-        // XOR: exactly one flip → CCW, both or neither → CW.
-        if (!(g_current_fvf & D3DFVF_XYZRHW)) {
-            bool mirror = (det3x3(view_model) < 0.0f);
-            glFrontFace((mirror != m_fbo_rendering) ? GL_CCW : GL_CW);
-        } else {
-            glFrontFace(GL_CW);
-        }
-
-        gl_set_matrix_uniform(g_mvp_uniform, &mvp);
-
-        // Set texture factor
-        if (g_texture_factor_uniform != -1) {
-            float r = ((m_texture_factor >> 16) & 0xFF) / 255.0f;
-            float g = ((m_texture_factor >> 8) & 0xFF) / 255.0f;
-            float b = (m_texture_factor & 0xFF) / 255.0f;
-            float a = ((m_texture_factor >> 24) & 0xFF) / 255.0f;
-            glUniform4f(g_texture_factor_uniform, r, g, b, a);
-        }
-
-        // Set mipmap LOD bias (D3D9 stores float as DWORD via type-punning).
-        // WebGL/OpenGL's LOD calculation uses a "max" rule that tends to select
-        // lower-res mip levels compared to D3D9 on the same hardware. An additional
-        // -0.75 offset compensates for this difference.
-        if (g_lod_bias_uniform != -1) {
-            DWORD bias_bits = g_sampler_states[0][D3DSAMP_MIPMAPLODBIAS];
-            float lod_bias;
-            memcpy(&lod_bias, &bias_bits, sizeof(float));
-            lod_bias -= 0.75f;
-            glUniform1f(g_lod_bias_uniform, lod_bias);
-        }
-
-        // Fog uniforms
-        {
-            bool apply_fog = m_fog_enabled && !(g_current_fvf & D3DFVF_XYZRHW);
-            glUniform1i(g_fog_enabled_uniform, apply_fog ? 1 : 0);
-            if (apply_fog) {
-                float r = ((m_fog_color >> 16) & 0xFF) / 255.0f;
-                float g_c = ((m_fog_color >> 8) & 0xFF) / 255.0f;
-                float b = (m_fog_color & 0xFF) / 255.0f;
-                glUniform3f(g_fog_color_uniform, r, g_c, b);
-                glUniform1f(g_fog_start_uniform, m_fog_start);
-                glUniform1f(g_fog_end_uniform, m_fog_end);
-                gl_set_matrix_uniform(g_view_model_uniform, &view_model);
-            }
-        }
-
-        // Set Stage 0 texture stage states
-        if (g_stage0_colorop_uniform != -1)
-            glUniform1i(g_stage0_colorop_uniform, g_texture_stage_states[0][D3DTSS_COLOROP]);
-        if (g_stage0_colorarg1_uniform != -1)
-            glUniform1i(g_stage0_colorarg1_uniform, g_texture_stage_states[0][D3DTSS_COLORARG1]);
-        if (g_stage0_colorarg2_uniform != -1)
-            glUniform1i(g_stage0_colorarg2_uniform, g_texture_stage_states[0][D3DTSS_COLORARG2]);
-        if (g_stage0_alphaop_uniform != -1)
-            glUniform1i(g_stage0_alphaop_uniform, g_texture_stage_states[0][D3DTSS_ALPHAOP]);
-        if (g_stage0_alphaarg1_uniform != -1)
-            glUniform1i(g_stage0_alphaarg1_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG1]);
-        if (g_stage0_alphaarg2_uniform != -1)
-            glUniform1i(g_stage0_alphaarg2_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG2]);
-
+        if (m_current_vertex_buffer == 0 || PrimitiveCount == 0) return D3D_OK;
+        GLsizei count;
+        GLenum mode = FFP_Primitive(PrimitiveType, PrimitiveCount, &count);
+        GLsizei stride = m_current_stride ? (GLsizei)m_current_stride : FFP_Stride(g_current_fvf);
         glBindBuffer(GL_ARRAY_BUFFER, m_current_vertex_buffer);
-
-        // FVF Parsing
-        bool has_xyz = (g_current_fvf & D3DFVF_XYZ) != 0;
-        bool has_xyzrhw = (g_current_fvf & D3DFVF_XYZRHW) != 0;
-        bool has_normal = (g_current_fvf & D3DFVF_NORMAL) != 0;
-        bool has_diffuse = (g_current_fvf & D3DFVF_DIFFUSE) != 0;
-        int tex_count = (g_current_fvf >> 8) & 0xF;
-
-        // Calculate offsets accounting for all FVF components
-        size_t offset = 0;
-        size_t position_offset = 0;
-        size_t normal_offset = 0;
-        size_t color_offset = 0;
-        size_t tex_offset = 0;
-
-        if (has_xyz) { position_offset = offset; offset += 12; }
-        if (has_xyzrhw) { position_offset = offset; offset += 16; }
-        if (has_normal) { normal_offset = offset; offset += 12; }
-        if (has_diffuse) { color_offset = offset; offset += 4; }
-        tex_offset = offset;
-
-        GLsizei stride = m_current_stride;
-
-        if ((has_xyz || has_xyzrhw) && g_position_location != -1) {
-            glEnableVertexAttribArray(g_position_location);
-            glVertexAttribPointer(g_position_location, has_xyzrhw ? 4 : 3, GL_FLOAT, GL_FALSE, stride, (void*)position_offset);
-        }
-
-        // Normal attribute for FFP lighting
-        if (has_normal && g_normal_location != -1) {
-            glEnableVertexAttribArray(g_normal_location);
-            glVertexAttribPointer(g_normal_location, 3, GL_FLOAT, GL_FALSE, stride, (void*)normal_offset);
-        } else if (g_normal_location != -1) {
-            glDisableVertexAttribArray(g_normal_location);
-            glVertexAttrib3f(g_normal_location, 0.0f, 0.0f, 1.0f);
-        }
-
-        // D3D9 FFP Lighting
-        bool lighting_enabled = has_normal && !has_xyzrhw && m_render_states[D3DRS_LIGHTING];
-        if (lighting_enabled) {
-            glUniform1i(g_lighting_enabled_uniform, 1);
-            SetFFPLightingUniforms(&m_world, m_render_states);
-
-            glDisableVertexAttribArray(g_color_location);
-            glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f);
-        } else {
-            glUniform1i(g_lighting_enabled_uniform, 0);
-            // Always set world matrix for clip plane (v_position_world) even without lighting
-            gl_set_matrix_uniform(g_world_uniform, &m_world);
-
-            if (has_diffuse && g_color_location != -1) {
-                glEnableVertexAttribArray(g_color_location);
-                glVertexAttribPointer(g_color_location, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void*)color_offset);
-            } else if (g_color_location != -1) {
-                glDisableVertexAttribArray(g_color_location);
-                glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f);
-            }
-        }
-
-        if (tex_count > 0 && g_texcoord_location != -1) {
-            glEnableVertexAttribArray(g_texcoord_location);
-            glVertexAttribPointer(g_texcoord_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)tex_offset);
-        } else if (g_texcoord_location != -1) {
-            glDisableVertexAttribArray(g_texcoord_location);
-            glVertexAttrib2f(g_texcoord_location, 0.0f, 0.0f);
-        }
-
-        // Texcoord1 - explicitly disable to avoid stale state
-        if (g_texcoord1_location != -1) {
-            glDisableVertexAttribArray(g_texcoord1_location);
-            glVertexAttrib2f(g_texcoord1_location, 0.0f, 0.0f);
-        }
-
-        // Texture setup
-        if (g_texture_stages[0] != 0 && tex_count > 0) {
-            glActiveTexture(GL_TEXTURE0);
-            if (g_cached_texture != g_texture_stages[0]) {
-                glBindTexture(GL_TEXTURE_2D, g_texture_stages[0]);
-                g_cached_texture = g_texture_stages[0];
-            }
-            ApplySamplerStates(0);
-            glUniform1i(g_texture_uniform, 0);
-            glUniform1i(g_use_texture_uniform, 1);
-        } else {
-            glUniform1i(g_use_texture_uniform, 0);
-        }
-
-        // Alpha test
-        glUniform1i(g_alpha_test_enabled_uniform, m_alpha_test_enabled ? 1 : 0);
-        glUniform1f(g_alpha_ref_uniform, (float)m_alpha_ref);
-
-        // Disable lightmap
-        glUniform1i(g_use_lightmap_uniform, 0);
-
-        GLenum type = GL_TRIANGLES;
-        UINT vcount = 0;
-        if (PrimitiveType == D3DPT_TRIANGLELIST) { type = GL_TRIANGLES; vcount = PrimitiveCount * 3; }
-        else if (PrimitiveType == D3DPT_TRIANGLESTRIP) { type = GL_TRIANGLE_STRIP; vcount = PrimitiveCount + 2; }
-        else if (PrimitiveType == D3DPT_TRIANGLEFAN) { type = GL_TRIANGLE_FAN; vcount = PrimitiveCount + 2; }
-
-        glDrawArrays(type, StartVertex, vcount);
-
+        FFP_SetupAttribs(g_current_fvf, m_stream_offset, stride);
+        PrepareDraw();
+        glDrawArrays(mode, StartVertex, count);
         return D3D_OK;
     }
     
@@ -1628,13 +1651,13 @@ public:
         D3D9Surface* dst = static_cast<D3D9Surface*>(pDestSurface);
 
         // Bind source to read framebuffer
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, src->m_is_backbuffer ? 0 : g_fbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, src->m_is_backbuffer ? 0 : g_fbo_read);
         if (!src->m_is_backbuffer) {
             glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src->m_gl_object, 0);
         }
 
         // Bind dest to draw framebuffer
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->m_is_backbuffer ? 0 : g_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->m_is_backbuffer ? 0 : g_fbo_aux);
         if (!dst->m_is_backbuffer) {
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst->m_gl_object, 0);
         }
@@ -1663,12 +1686,7 @@ public:
         }
 
         // Restore original RT binding
-        if (m_current_rt->m_is_backbuffer) {
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        } else {
-            glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_current_rt->m_gl_object, 0);
-        }
+        glBindFramebuffer(GL_FRAMEBUFFER, m_fbo_rendering ? g_fbo : 0);
         
         return D3D_OK;
     }
@@ -1700,6 +1718,14 @@ public:
         glDepthMask(GL_TRUE);
 
         CHECK_GL_ERROR(glClear(mask));
+#ifdef DEBUG_TEXTURE_TEST
+        { static int n = 0; if (n < 40) { n++;
+            GLint fb = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+            printf("[clear] mask %x fb %d status %x rt %p %ux%u obj %u bb %d ds %p %ux%u obj %u fborend %d\n", mask, fb,
+                glCheckFramebufferStatus(GL_FRAMEBUFFER), m_current_rt, m_current_rt ? m_current_rt->m_width : 0, m_current_rt ? m_current_rt->m_height : 0,
+                m_current_rt ? m_current_rt->m_gl_object : 0, m_current_rt ? m_current_rt->m_is_backbuffer : -1,
+                m_current_ds, m_current_ds ? m_current_ds->m_width : 0, m_current_ds ? m_current_ds->m_height : 0, m_current_ds ? m_current_ds->m_gl_object : 0, m_fbo_rendering); } }
+#endif
 
         // Restore masks from tracked state (no GPU readback)
         glColorMask(color_write_enabled_r, color_write_enabled_g, color_write_enabled_b, color_write_enabled_a);
@@ -1718,6 +1744,9 @@ public:
     
     virtual HRESULT Present(const void* pSourceRect, const void* pDestRect,
                            HWND hDestWindowOverride, const void* pDirtyRegion) override {
+#ifdef DEBUG_TEXTURE_TEST
+        g_dbg_frame++;
+#endif
         return D3D_OK;
     }
     
@@ -1785,344 +1814,20 @@ static void ApplySamplerStates(DWORD Sampler) {
                                    UINT PrimitiveCount,
                                    const void* pVertexStreamZeroData,
                                    UINT VertexStreamZeroStride) override {
-        if (!pVertexStreamZeroData) return -1;
-
-        if (g_shader_program == 0) init_shaders();
-
-        // State Caching: Only call glUseProgram if program changed
-        if (g_cached_program != g_shader_program) {
-            glUseProgram(g_shader_program);
-            g_cached_program = g_shader_program;
-        }
-
-        // FBO Y-flip and clip plane uniforms
-        glUniform1i(g_fbo_flip_y_uniform, m_fbo_rendering ? 1 : 0);
-        glUniform1i(g_clip_plane_enabled_uniform, m_clip_plane_enabled ? 1 : 0);
-        if (m_clip_plane_enabled) glUniform4fv(g_clip_plane_uniform, 1, m_clip_planes[0]);
-
+        if (!pVertexStreamZeroData) return D3DERR_INVALIDCALL;
+        if (PrimitiveCount == 0) return D3D_OK;
+        GLsizei count;
+        GLenum mode = FFP_Primitive(PrimitiveType, PrimitiveCount, &count);
         EnsureUPBuffers();
-        CHECK_GL_ERROR(glBindBuffer(GL_ARRAY_BUFFER, g_up_vbo));
-        CHECK_GL_ERROR(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)); // No indices for UP
-
-        // Dynamic FVF Parsing
-        bool has_xyz = (g_current_fvf & D3DFVF_XYZ) != 0;
-        bool has_xyzrhw = (g_current_fvf & D3DFVF_XYZRHW) != 0;
-        bool has_normal = (g_current_fvf & D3DFVF_NORMAL) != 0;
-        bool has_diffuse = (g_current_fvf & D3DFVF_DIFFUSE) != 0;
-        int tex_count = (g_current_fvf >> 8) & 0xF;
-
-        GLsizei stride = 0;
-        size_t position_offset = 0;
-        size_t normal_offset = 0;
-        size_t color_offset = 0;
-        size_t tex_offset = 0;
-
-        // XYZ and XYZRHW are mutually exclusive in D3D9 FVF
-        if (has_xyzrhw) { position_offset = stride; stride += 16; }
-        else if (has_xyz) { position_offset = stride; stride += 12; }
-        if (has_normal) { normal_offset = stride; stride += 12; }
-        if (has_diffuse) { color_offset = stride; stride += 4; }
-        tex_offset = stride;
-        stride += tex_count * 8;
-        
-        if (VertexStreamZeroStride > 0) stride = VertexStreamZeroStride;
-
-        // Override Viewport for UI rendering to ensure it covers the full canvas
-        GLint saved_viewport[4];
-        bool override_viewport = false;
-        
-        // Restore state variables
-        GLboolean saved_scissor_test = GL_FALSE;
-        GLint saved_scissor_box[4];
-
-        if ((g_current_fvf & D3DFVF_XYZRHW) && m_current_rt && m_current_rt->m_is_backbuffer) {
-            // Use cached viewport instead of glGetIntegerv (performance optimization)
-            saved_viewport[0] = g_cached_viewport[0];
-            saved_viewport[1] = g_cached_viewport[1];
-            saved_viewport[2] = g_cached_viewport[2];
-            saved_viewport[3] = g_cached_viewport[3];
-
-            glViewport(0, 0, g_logical_width, g_logical_height);
-
-            // Disable Culling and Depth Test for 2D UI elements to ensure visibility
-            glDisable(GL_CULL_FACE);
-            glDisable(GL_DEPTH_TEST);
-            glDepthMask(GL_FALSE);
-
-            // Use cached scissor state instead of glGet* (performance optimization)
-            saved_scissor_test = g_cached_scissor_test;
-            saved_scissor_box[0] = g_cached_scissor_box[0];
-            saved_scissor_box[1] = g_cached_scissor_box[1];
-            saved_scissor_box[2] = g_cached_scissor_box[2];
-            saved_scissor_box[3] = g_cached_scissor_box[3];
-
-            glEnable(GL_SCISSOR_TEST);
-
-            // Scissor to current viewport area (WebGL Y is bottom-to-top)
-            int sy = g_logical_height - (g_viewport.Y + g_viewport.Height);
-            glScissor(g_viewport.X, sy, g_viewport.Width, g_viewport.Height);
-            
-            override_viewport = true;
-        }
-
-        // Calculate MVP
-        D3DMATRIX view_model, mvp;
-        if (g_current_fvf & D3DFVF_XYZRHW) {
-            // For XYZRHW, use the app's logical resolution
-            float sw = (float)g_logical_width;
-            float sh = (float)g_logical_height;
-            // If rendering to texture, use texture dimensions
-            if (m_current_rt && !m_current_rt->m_is_backbuffer) {
-                 sw = (float)m_current_rt->m_width;
-                 sh = (float)m_current_rt->m_height;
-            }
-
-            memset(&mvp, 0, sizeof(D3DMATRIX));
-            mvp.m[0][0] = 2.0f / sw;
-            mvp.m[1][1] = -2.0f / sh; 
-            mvp.m[3][0] = -1.0f;
-            mvp.m[3][1] = 1.0f;
-            mvp.m[2][2] = 1.0f;
-            mvp.m[3][3] = 1.0f;
-            mvp.m[3][2] = 0.0f;
-        } else {
-            matrix_multiply(&view_model, &m_world, &m_view);
-            matrix_multiply(&mvp, &view_model, &m_projection);
-        }
-
-        // Winding detection: D3D9 auto-flips culling for mirrored transforms; we emulate it
-        if (!(g_current_fvf & D3DFVF_XYZRHW)) {
-            bool mirror = (det3x3(view_model) < 0.0f);
-            glFrontFace((mirror != m_fbo_rendering) ? GL_CCW : GL_CW);
-        } else {
-            glFrontFace(GL_CW);
-        }
-
-        gl_set_matrix_uniform(g_mvp_uniform, &mvp);
-
-        if (g_texture_factor_uniform != -1) {
-            float r = ((m_texture_factor >> 16) & 0xFF) / 255.0f;
-            float g = ((m_texture_factor >> 8) & 0xFF) / 255.0f;
-            float b = (m_texture_factor & 0xFF) / 255.0f;
-            float a = ((m_texture_factor >> 24) & 0xFF) / 255.0f;
-            glUniform4f(g_texture_factor_uniform, r, g, b, a);
-        }
-
-        // Set mipmap LOD bias (D3D9 stores float as DWORD via type-punning).
-        // WebGL/OpenGL's LOD calculation uses a "max" rule that tends to select
-        // lower-res mip levels compared to D3D9 on the same hardware. An additional
-        // -0.75 offset compensates for this difference.
-        if (g_lod_bias_uniform != -1) {
-            DWORD bias_bits = g_sampler_states[0][D3DSAMP_MIPMAPLODBIAS];
-            float lod_bias;
-            memcpy(&lod_bias, &bias_bits, sizeof(float));
-            lod_bias -= 0.75f;
-            glUniform1f(g_lod_bias_uniform, lod_bias);
-        }
-
-        // Set Stage 0 texture stage states
-        if (g_stage0_colorop_uniform != -1) {
-            glUniform1i(g_stage0_colorop_uniform, g_texture_stage_states[0][D3DTSS_COLOROP]);
-        }
-        if (g_stage0_colorarg1_uniform != -1) {
-            glUniform1i(g_stage0_colorarg1_uniform, g_texture_stage_states[0][D3DTSS_COLORARG1]);
-        }
-        if (g_stage0_colorarg2_uniform != -1) {
-            glUniform1i(g_stage0_colorarg2_uniform, g_texture_stage_states[0][D3DTSS_COLORARG2]);
-        }
-        if (g_stage0_alphaop_uniform != -1) {
-            glUniform1i(g_stage0_alphaop_uniform, g_texture_stage_states[0][D3DTSS_ALPHAOP]);
-        }
-        if (g_stage0_alphaarg1_uniform != -1) {
-            glUniform1i(g_stage0_alphaarg1_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG1]);
-        }
-        if (g_stage0_alphaarg2_uniform != -1) {
-            glUniform1i(g_stage0_alphaarg2_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG2]);
-        }
-
-        // Fog uniforms
-        {
-            bool apply_fog = m_fog_enabled && !(g_current_fvf & D3DFVF_XYZRHW);
-            glUniform1i(g_fog_enabled_uniform, apply_fog ? 1 : 0);
-            if (apply_fog) {
-                float r = ((m_fog_color >> 16) & 0xFF) / 255.0f;
-                float g_c = ((m_fog_color >> 8) & 0xFF) / 255.0f;
-                float b = (m_fog_color & 0xFF) / 255.0f;
-                glUniform3f(g_fog_color_uniform, r, g_c, b);
-                glUniform1f(g_fog_start_uniform, m_fog_start);
-                glUniform1f(g_fog_end_uniform, m_fog_end);
-                gl_set_matrix_uniform(g_view_model_uniform, &view_model);
-            }
-        }
-
-        const uint8_t* vertex_data = static_cast<const uint8_t*>(pVertexStreamZeroData);
-
-        // Calculate vertex count and total size
-        UINT vertex_count = 0;
-         switch (PrimitiveType) {
-            case D3DPT_TRIANGLELIST: vertex_count = PrimitiveCount * 3; break;
-            case D3DPT_TRIANGLESTRIP: vertex_count = PrimitiveCount + 2; break;
-            case D3DPT_TRIANGLEFAN: vertex_count = PrimitiveCount + 2; break;
-            case D3DPT_LINELIST: vertex_count = PrimitiveCount * 2; break;
-            case D3DPT_LINESTRIP: vertex_count = PrimitiveCount + 1; break;
-            case D3DPT_POINTLIST: vertex_count = PrimitiveCount; break;
-        }
-        
-        size_t total_size = stride * vertex_count;
-
-        // Convert BGRA vertex colors to RGBA if needed
-        bool converted = false;
-        static std::vector<uint8_t> converted_data;
-        if (has_diffuse) {
-            converted_data.resize(total_size);
-            memcpy(converted_data.data(), pVertexStreamZeroData, total_size);
-            
-            // Swap R and B in each vertex's color (BGRA -> RGBA)
-            // [WASM] Restore Red-Blue swap for vertex colors (BGRA -> RGBA)
-            for (UINT i = 0; i < vertex_count; ++i) {
-                uint8_t* color_ptr = converted_data.data() + (i * stride) + color_offset;
-                std::swap(color_ptr[0], color_ptr[2]); 
-                
-                // Removed: Force Alpha to 255 if it's 0
-                // This was breaking opacity functionality for UI elements (glow effects, etc.)
-                // D3D9 FFP respects alpha=0 for transparency when D3DFVF_DIFFUSE is specified
-            }
-            vertex_data = converted_data.data();
-            converted = true;
-        }
-
-        // Upload to VBO - Use persistent buffer for better performance
-        if (total_size > g_up_vbo_size) {
-            // Buffer too small, reallocate with 2x growth strategy
-            size_t new_size = total_size * 2;
-            CHECK_GL_ERROR(glBufferData(GL_ARRAY_BUFFER, new_size, nullptr, GL_DYNAMIC_DRAW));
-            g_up_vbo_size = new_size;
-        }
-        // Just update the data (fast path - avoids buffer reallocation)
-        CHECK_GL_ERROR(glBufferSubData(GL_ARRAY_BUFFER, 0, total_size, vertex_data));
-        
-        // Enable/Set Pointers (Use offsets!)
-        if (has_xyzrhw) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_position_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_position_location, 4, GL_FLOAT, GL_FALSE, stride, (void*)position_offset));
-        } else if (has_xyz) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_position_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_position_location, 3, GL_FLOAT, GL_FALSE, stride, (void*)position_offset));
-        }
-
-        // Normal attribute for FFP lighting
-        if (has_normal && g_normal_location != -1) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_normal_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_normal_location, 3, GL_FLOAT, GL_FALSE, stride, (void*)normal_offset));
-        } else if (g_normal_location != -1) {
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_normal_location));
-            CHECK_GL_ERROR(glVertexAttrib3f(g_normal_location, 0.0f, 0.0f, 1.0f));
-        }
-
-        // D3D9 FFP Lighting: when FVF has NORMAL and D3DRS_LIGHTING is TRUE
-        bool lighting_enabled = has_normal && !has_xyzrhw && m_render_states[D3DRS_LIGHTING];
-        if (lighting_enabled) {
-            CHECK_GL_ERROR(glUniform1i(g_lighting_enabled_uniform, 1));
-            SetFFPLightingUniforms(&m_world, m_render_states);
-
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_color_location));
-            CHECK_GL_ERROR(glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f));
-        } else {
-            CHECK_GL_ERROR(glUniform1i(g_lighting_enabled_uniform, 0));
-            // Always set world matrix for clip plane (v_position_world) even without lighting
-            gl_set_matrix_uniform(g_world_uniform, &m_world);
-
-            if (has_diffuse) {
-                CHECK_GL_ERROR(glEnableVertexAttribArray(g_color_location));
-                CHECK_GL_ERROR(glVertexAttribPointer(g_color_location, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void*)color_offset));
-            } else {
-                CHECK_GL_ERROR(glDisableVertexAttribArray(g_color_location));
-                CHECK_GL_ERROR(glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f));
-            }
-        }
-
-        if (tex_count > 0) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_texcoord_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_texcoord_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)tex_offset));
-        } else {
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_texcoord_location));
-            CHECK_GL_ERROR(glVertexAttrib2f(g_texcoord_location, 0.0f, 0.0f));
-        }
-
-        if (tex_count > 1) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_texcoord1_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_texcoord1_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)(tex_offset + 8)));
-        } else {
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_texcoord1_location));
-            CHECK_GL_ERROR(glVertexAttrib2f(g_texcoord1_location, 0.0f, 0.0f));
-        }
-        
-        // Texture setup
-        if (g_texture_stages[0] != 0 && tex_count > 0) {
-            CHECK_GL_ERROR(glActiveTexture(GL_TEXTURE0));
-
-            // State Caching: Only bind texture if it changed
-            if (g_cached_texture != g_texture_stages[0]) {
-                CHECK_GL_ERROR(glBindTexture(GL_TEXTURE_2D, g_texture_stages[0]));
-                g_cached_texture = g_texture_stages[0];
-            }
-
-            CHECK_GL_ERROR(glUniform1i(g_texture_uniform, 0));
-            CHECK_GL_ERROR(glUniform1i(g_use_texture_uniform, 1));
-
-            // Apply D3D sampler states (Filter, Wrap)
-            ApplySamplerStates(0);
-        } else {
-            // No texture case - bind texture 0
-            // IMPORTANT: Must set active texture unit to TEXTURE0 before unbinding,
-            // otherwise we may accidentally unbind GL_TEXTURE1 (lightmap) if that was
-            // the last active unit (e.g., after DrawIndexedPrimitive's lightmap setup).
-            CHECK_GL_ERROR(glActiveTexture(GL_TEXTURE0));
-            if (g_cached_texture != 0) {
-                CHECK_GL_ERROR(glBindTexture(GL_TEXTURE_2D, 0));
-                g_cached_texture = 0;
-            }
-            CHECK_GL_ERROR(glUniform1i(g_use_texture_uniform, 0));
-        }
-
-        CHECK_GL_ERROR(glUniform1i(g_alpha_test_enabled_uniform, m_alpha_test_enabled ? 1 : 0));
-        CHECK_GL_ERROR(glUniform1f(g_alpha_ref_uniform, (float)m_alpha_ref));
-
-        // Disable lightmap to avoid stale state from DrawIndexedPrimitive
-        CHECK_GL_ERROR(glUniform1i(g_use_lightmap_uniform, 0));
-
-        // Draw
-        GLenum gl_primitive_type = GL_TRIANGLES;
-        switch (PrimitiveType) {
-            case D3DPT_TRIANGLELIST: gl_primitive_type = GL_TRIANGLES; break;
-            case D3DPT_TRIANGLESTRIP: gl_primitive_type = GL_TRIANGLE_STRIP; break;
-            case D3DPT_TRIANGLEFAN: gl_primitive_type = GL_TRIANGLE_FAN; break;
-            case D3DPT_LINELIST: gl_primitive_type = GL_LINES; break;
-            case D3DPT_LINESTRIP: gl_primitive_type = GL_LINE_STRIP; break;
-            case D3DPT_POINTLIST: gl_primitive_type = GL_POINTS; break;
-        }
-
-        CHECK_GL_ERROR(glDrawArrays(gl_primitive_type, 0, vertex_count));
-
-        // Cleanup pointers (unbind RB to be safe?)
-        CHECK_GL_ERROR(glBindBuffer(GL_ARRAY_BUFFER, 0));
-
-        // Restore Viewport/Scissor/DepthTest/CullFace if overridden
-        if (override_viewport) {
-            glViewport(saved_viewport[0], saved_viewport[1], saved_viewport[2], saved_viewport[3]);
-
-            if (saved_scissor_test) {
-                glScissor(saved_scissor_box[0], saved_scissor_box[1], saved_scissor_box[2], saved_scissor_box[3]);
-            } else {
-                glDisable(GL_SCISSOR_TEST);
-            }
-
-            // Restore depth test, depth mask, and cull face from tracked render states
-            if (m_render_states[D3DRS_ZENABLE]) glEnable(GL_DEPTH_TEST);
-            if (m_render_states[D3DRS_ZWRITEENABLE]) glDepthMask(GL_TRUE);
-            if (m_render_states[D3DRS_CULLMODE] != D3DCULL_NONE) glEnable(GL_CULL_FACE);
-        }
-
+        glBindBuffer(GL_ARRAY_BUFFER, g_up_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)count * VertexStreamZeroStride, pVertexStreamZeroData, GL_STREAM_DRAW);
+        FFP_SetupAttribs(g_current_fvf, 0, VertexStreamZeroStride);
+        PrepareDraw();
+        glDrawArrays(mode, 0, count);
+        // like D3D9: a UP draw leaves stream 0 unset
+        m_current_vertex_buffer = 0;
+        m_current_stride = 0;
+        m_stream_offset = 0;
         return D3D_OK;
     }
     virtual HRESULT DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex,
@@ -2130,311 +1835,25 @@ static void ApplySamplerStates(DWORD Sampler) {
                                            const void* pIndexData, D3DFORMAT IndexDataFormat,
                                            const void* pVertexStreamZeroData,
                                            UINT VertexStreamZeroStride) override {
-        if (!pVertexStreamZeroData || !pIndexData) return -1;
-
-        if (g_shader_program == 0) init_shaders();
-        glUseProgram(g_shader_program);
-
-        // FBO Y-flip and clip plane uniforms
-        glUniform1i(g_fbo_flip_y_uniform, m_fbo_rendering ? 1 : 0);
-        glUniform1i(g_clip_plane_enabled_uniform, m_clip_plane_enabled ? 1 : 0);
-        if (m_clip_plane_enabled) glUniform4fv(g_clip_plane_uniform, 1, m_clip_planes[0]);
-
+        if (!pVertexStreamZeroData || !pIndexData) return D3DERR_INVALIDCALL;
+        if (PrimitiveCount == 0) return D3D_OK;
+        GLsizei count;
+        GLenum mode = FFP_Primitive(PrimitiveType, PrimitiveCount, &count);
+        bool i32 = IndexDataFormat == D3DFMT_INDEX32;
         EnsureUPBuffers();
-        CHECK_GL_ERROR(glBindBuffer(GL_ARRAY_BUFFER, g_up_vbo));
-        CHECK_GL_ERROR(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_up_ibo));
-
-        // Respect game's blend state (set via SetRenderState before this draw call)
-
-        // Calculate MVP
-        D3DMATRIX view_model, mvp;
-        if (g_current_fvf & D3DFVF_XYZRHW) {
-            float vw = (g_viewport.Width > 0) ? (float)g_viewport.Width : (float)g_logical_width;
-            float vh = (g_viewport.Height > 0) ? (float)g_viewport.Height : (float)g_logical_height;
-
-            memset(&mvp, 0, sizeof(D3DMATRIX));
-            mvp.m[0][0] = 2.0f / vw;
-            mvp.m[3][0] = -1.0f;
-            mvp.m[1][1] = -2.0f / vh;
-            mvp.m[3][1] = 1.0f;
-            mvp.m[2][2] = 1.0f;
-            mvp.m[3][3] = 1.0f;
-        } else {
-            matrix_multiply(&view_model, &m_world, &m_view);
-            matrix_multiply(&mvp, &view_model, &m_projection);
-        }
-
-        // Winding detection: D3D9 auto-flips culling for mirrored transforms; we emulate it
-        if (!(g_current_fvf & D3DFVF_XYZRHW)) {
-            bool mirror = (det3x3(view_model) < 0.0f);
-            glFrontFace((mirror != m_fbo_rendering) ? GL_CCW : GL_CW);
-        } else {
-            glFrontFace(GL_CW);
-        }
-
-        gl_set_matrix_uniform(g_mvp_uniform, &mvp);
-
-        // Set texture factor
-        if (g_texture_factor_uniform != -1) {
-            float r = ((m_texture_factor >> 16) & 0xFF) / 255.0f;
-            float g = ((m_texture_factor >> 8) & 0xFF) / 255.0f;
-            float b = (m_texture_factor & 0xFF) / 255.0f;
-            float a = ((m_texture_factor >> 24) & 0xFF) / 255.0f;
-            glUniform4f(g_texture_factor_uniform, r, g, b, a);
-        }
-
-        // Set mipmap LOD bias (D3D9 stores float as DWORD via type-punning).
-        // WebGL/OpenGL's LOD calculation uses a "max" rule that tends to select
-        // lower-res mip levels compared to D3D9 on the same hardware. An additional
-        // -0.75 offset compensates for this difference.
-        if (g_lod_bias_uniform != -1) {
-            DWORD bias_bits = g_sampler_states[0][D3DSAMP_MIPMAPLODBIAS];
-            float lod_bias;
-            memcpy(&lod_bias, &bias_bits, sizeof(float));
-            lod_bias -= 0.75f;
-            glUniform1f(g_lod_bias_uniform, lod_bias);
-        }
-
-        // Set Stage 0 texture stage states
-        if (g_stage0_colorop_uniform != -1) {
-            glUniform1i(g_stage0_colorop_uniform, g_texture_stage_states[0][D3DTSS_COLOROP]);
-        }
-
-        if (g_stage0_colorarg1_uniform != -1) {
-            glUniform1i(g_stage0_colorarg1_uniform, g_texture_stage_states[0][D3DTSS_COLORARG1]);
-        }
-        if (g_stage0_colorarg2_uniform != -1) {
-            glUniform1i(g_stage0_colorarg2_uniform, g_texture_stage_states[0][D3DTSS_COLORARG2]);
-        }
-        if (g_stage0_alphaop_uniform != -1) {
-            glUniform1i(g_stage0_alphaop_uniform, g_texture_stage_states[0][D3DTSS_ALPHAOP]);
-        }
-        if (g_stage0_alphaarg1_uniform != -1) {
-            glUniform1i(g_stage0_alphaarg1_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG1]);
-        }
-        if (g_stage0_alphaarg2_uniform != -1) {
-            glUniform1i(g_stage0_alphaarg2_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG2]);
-        }
-
-        // Fog uniforms
-        {
-            bool apply_fog = m_fog_enabled && !(g_current_fvf & D3DFVF_XYZRHW);
-            glUniform1i(g_fog_enabled_uniform, apply_fog ? 1 : 0);
-            if (apply_fog) {
-                float r = ((m_fog_color >> 16) & 0xFF) / 255.0f;
-                float g_c = ((m_fog_color >> 8) & 0xFF) / 255.0f;
-                float b = (m_fog_color & 0xFF) / 255.0f;
-                glUniform3f(g_fog_color_uniform, r, g_c, b);
-                glUniform1f(g_fog_start_uniform, m_fog_start);
-                glUniform1f(g_fog_end_uniform, m_fog_end);
-                gl_set_matrix_uniform(g_view_model_uniform, &view_model);
-            }
-        }
-
-        // Dynamic FVF Parsing
-        bool has_xyz = (g_current_fvf & D3DFVF_XYZ) != 0;
-        bool has_xyzrhw = (g_current_fvf & D3DFVF_XYZRHW) != 0;
-        bool has_normal = (g_current_fvf & D3DFVF_NORMAL) != 0;
-        bool has_diffuse = (g_current_fvf & D3DFVF_DIFFUSE) != 0;
-        int tex_count = (g_current_fvf >> 8) & 0xF;
-
-        GLsizei stride = 0;
-        size_t position_offset = 0;
-        size_t normal_offset = 0;
-        size_t color_offset = 0;
-        size_t tex_offset = 0;
-
-        // XYZ and XYZRHW are mutually exclusive in D3D9 FVF
-        if (has_xyzrhw) { position_offset = stride; stride += 16; }
-        else if (has_xyz) { position_offset = stride; stride += 12; }
-        if (has_normal) { normal_offset = stride; stride += 12; }
-        if (has_diffuse) { color_offset = stride; stride += 4; }
-        tex_offset = stride;
-        stride += tex_count * 8;
-
-        if (VertexStreamZeroStride > 0) stride = VertexStreamZeroStride;
-
-        const uint8_t* vertex_data = static_cast<const uint8_t*>(pVertexStreamZeroData);
-
-        // Upload Vertices
-        // NumVertices isn't reliable for buffer size, but MinVertexIndex + NumVertices is max index.
-        // For simplicity, we assume we need to upload consistent with PrimitiveCount, 
-        // BUT indexed usage is tricky. We'll reuse NumVertices logic but be careful.
-        // Actually, for direct pointer indexed drawing, we should upload the whole range used.
-        // Simplest safe bet: upload everything provided... but we only have a pointer.
-        // We HAVE to trust NumVertices.
-        
-        size_t total_v_size = stride * NumVertices;
-        
-        // BGRA -> RGBA conversion
-        static std::vector<uint8_t> converted_v_data;
-        if (has_diffuse) {
-            converted_v_data.resize(total_v_size);
-            memcpy(converted_v_data.data(), pVertexStreamZeroData, total_v_size);
-             for (UINT i = 0; i < NumVertices; ++i) {
-                uint8_t* color_ptr = converted_v_data.data() + (i * stride) + color_offset;
-                std::swap(color_ptr[0], color_ptr[2]);
-                // D3D9 FFP respects alpha=0 for transparency when D3DFVF_DIFFUSE is specified.
-                // Do NOT force alpha=255 here; doing so breaks opacity for UI elements and glow effects.
-                // (Aligned with DrawPrimitiveUP behavior.)
-            }
-            vertex_data = converted_v_data.data();
-        }
-
-        // Upload Vertices - Use persistent buffer for better performance
-        if (total_v_size > g_up_vbo_size) {
-            // Buffer too small, reallocate with 2x growth strategy
-            size_t new_size = total_v_size * 2;
-            CHECK_GL_ERROR(glBufferData(GL_ARRAY_BUFFER, new_size, nullptr, GL_DYNAMIC_DRAW));
-            g_up_vbo_size = new_size;
-        }
-        // Just update the data (fast path - avoids buffer reallocation)
-        CHECK_GL_ERROR(glBufferSubData(GL_ARRAY_BUFFER, 0, total_v_size, vertex_data));
-
-        // Upload Indices
-        // PrimitiveCount triangles/lines etc.
-        size_t index_size = (IndexDataFormat == D3DFMT_INDEX16) ? 2 : 4;
-        size_t index_count = 0;
-        switch (PrimitiveType) {
-            case D3DPT_TRIANGLELIST: index_count = PrimitiveCount * 3; break;
-            case D3DPT_TRIANGLESTRIP: index_count = PrimitiveCount + 2; break; // Approximated
-            case D3DPT_TRIANGLEFAN: index_count = PrimitiveCount + 2; break; // Approximated
-            // Lines etc
-            default: index_count = PrimitiveCount * 3; // Safe bet for alloc
-        }
-        
-        // Actually, primitives define how many indices we read.
-        size_t total_i_size = index_count * index_size;
-
-        // Upload Indices - Use persistent buffer for better performance
-        if (total_i_size > g_up_ibo_size) {
-            // Buffer too small, reallocate with 2x growth strategy
-            size_t new_size = total_i_size * 2;
-            CHECK_GL_ERROR(glBufferData(GL_ELEMENT_ARRAY_BUFFER, new_size, nullptr, GL_DYNAMIC_DRAW));
-            g_up_ibo_size = new_size;
-        }
-        // Just update the data (fast path - avoids buffer reallocation)
-        CHECK_GL_ERROR(glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, total_i_size, pIndexData));
-
-         // Enable/Set Pointers (Use offsets!)
-        if (has_xyzrhw) {
-            // [IMPORTANT] Pass all 4 components for XYZRHW to properly set gl_Position.w
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_position_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_position_location, 4, GL_FLOAT, GL_FALSE, stride, (void*)position_offset));
-        } else if (has_xyz) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_position_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_position_location, 3, GL_FLOAT, GL_FALSE, stride, (void*)position_offset));
-        }
-
-        // Normal attribute for FFP lighting
-        if (has_normal && g_normal_location != -1) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_normal_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_normal_location, 3, GL_FLOAT, GL_FALSE, stride, (void*)normal_offset));
-        } else if (g_normal_location != -1) {
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_normal_location));
-            CHECK_GL_ERROR(glVertexAttrib3f(g_normal_location, 0.0f, 0.0f, 1.0f));
-        }
-
-        // D3D9 FFP Lighting: when FVF has NORMAL and D3DRS_LIGHTING is TRUE
-        bool lighting_enabled = has_normal && !has_xyzrhw && m_render_states[D3DRS_LIGHTING];
-        if (lighting_enabled) {
-            CHECK_GL_ERROR(glUniform1i(g_lighting_enabled_uniform, 1));
-            SetFFPLightingUniforms(&m_world, m_render_states);
-
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_color_location));
-            CHECK_GL_ERROR(glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f));
-        } else {
-            CHECK_GL_ERROR(glUniform1i(g_lighting_enabled_uniform, 0));
-            // Always set world matrix for clip plane (v_position_world) even without lighting
-            gl_set_matrix_uniform(g_world_uniform, &m_world);
-
-            if (has_diffuse) {
-                CHECK_GL_ERROR(glEnableVertexAttribArray(g_color_location));
-                CHECK_GL_ERROR(glVertexAttribPointer(g_color_location, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void*)color_offset));
-            } else {
-                CHECK_GL_ERROR(glDisableVertexAttribArray(g_color_location));
-                CHECK_GL_ERROR(glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f));
-            }
-        }
-
-        if (tex_count > 0) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_texcoord_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_texcoord_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)tex_offset));
-        } else {
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_texcoord_location));
-            CHECK_GL_ERROR(glVertexAttrib2f(g_texcoord_location, 0.0f, 0.0f));
-        }
-
-        // Texcoord1 (second UV set) - must explicitly handle to avoid stale state
-        if (tex_count > 1 && g_texcoord1_location != -1) {
-            CHECK_GL_ERROR(glEnableVertexAttribArray(g_texcoord1_location));
-            CHECK_GL_ERROR(glVertexAttribPointer(g_texcoord1_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)(tex_offset + 8)));
-        } else if (g_texcoord1_location != -1) {
-            CHECK_GL_ERROR(glDisableVertexAttribArray(g_texcoord1_location));
-            CHECK_GL_ERROR(glVertexAttrib2f(g_texcoord1_location, 0.0f, 0.0f));
-        }
-
-        // Texture setup
-        if (g_texture_stages[0] != 0 && tex_count > 0) {
-            CHECK_GL_ERROR(glActiveTexture(GL_TEXTURE0));
-
-            // State Caching: Only bind texture if it changed
-            if (g_cached_texture != g_texture_stages[0]) {
-                CHECK_GL_ERROR(glBindTexture(GL_TEXTURE_2D, g_texture_stages[0]));
-                g_cached_texture = g_texture_stages[0];
-            }
-
-            CHECK_GL_ERROR(glUniform1i(g_texture_uniform, 0));
-            CHECK_GL_ERROR(glUniform1i(g_use_texture_uniform, 1));
-
-            // Apply D3D sampler states (Filter, Wrap)
-            ApplySamplerStates(0);
-        } else {
-            // No texture case - bind texture 0
-            // IMPORTANT: Must set active texture unit to TEXTURE0 before unbinding,
-            // otherwise we may accidentally unbind GL_TEXTURE1 (lightmap) if that was
-            // the last active unit (e.g., after DrawIndexedPrimitive's lightmap setup).
-            CHECK_GL_ERROR(glActiveTexture(GL_TEXTURE0));
-            if (g_cached_texture != 0) {
-                CHECK_GL_ERROR(glBindTexture(GL_TEXTURE_2D, 0));
-                g_cached_texture = 0;
-            }
-            CHECK_GL_ERROR(glUniform1i(g_use_texture_uniform, 0));
-        }
-
-        CHECK_GL_ERROR(glUniform1i(g_alpha_test_enabled_uniform, m_alpha_test_enabled ? 1 : 0));
-        CHECK_GL_ERROR(glUniform1f(g_alpha_ref_uniform, (float)m_alpha_ref));
-
-        // Stage 1 / Lightmap setup - must explicitly set to avoid stale state from DrawIndexedPrimitive
-        if (g_texture_stages[1] != 0 && tex_count > 1) {
-            CHECK_GL_ERROR(glActiveTexture(GL_TEXTURE1));
-            CHECK_GL_ERROR(glBindTexture(GL_TEXTURE_2D, g_texture_stages[1]));
-            g_last_bound_lightmap_id = g_texture_stages[1];
-            CHECK_GL_ERROR(glUniform1i(g_texture_lm_uniform, 1));
-            CHECK_GL_ERROR(glUniform1i(g_use_lightmap_uniform, 1));
-            DWORD op = g_texture_stage_states[1][D3DTSS_COLOROP];
-            CHECK_GL_ERROR(glUniform1i(g_stage1_op_uniform, op));
-            CHECK_GL_ERROR(glActiveTexture(GL_TEXTURE0));
-        } else {
-            CHECK_GL_ERROR(glUniform1i(g_use_lightmap_uniform, 0));
-        }
-
-        GLenum gl_primitive_type = GL_TRIANGLES;
-        switch (PrimitiveType) {
-            case D3DPT_TRIANGLELIST: gl_primitive_type = GL_TRIANGLES; break;
-            // Others ignored for simplicity as they are rare in indexed
-            default: gl_primitive_type = GL_TRIANGLES;
-        }
-
-        GLenum gl_index_type = (IndexDataFormat == D3DFMT_INDEX16) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
-
-        CHECK_GL_ERROR(glDrawElements(gl_primitive_type, index_count, gl_index_type, 0));
-
-        CHECK_GL_ERROR(glBindBuffer(GL_ARRAY_BUFFER, 0));
-        CHECK_GL_ERROR(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
-
-        // Blend state is managed by game's SetRenderState calls
-
+        glBindBuffer(GL_ARRAY_BUFFER, g_up_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(MinVertexIndex + NumVertices) * VertexStreamZeroStride,
+                     pVertexStreamZeroData, GL_STREAM_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_up_ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)count * (i32 ? 4 : 2), pIndexData, GL_STREAM_DRAW);
+        FFP_SetupAttribs(g_current_fvf, 0, VertexStreamZeroStride);
+        PrepareDraw();
+        glDrawElements(mode, count, i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, 0);
+        // like D3D9: a UP draw leaves stream 0 and the indices unset
+        m_current_vertex_buffer = 0;
+        m_current_stride = 0;
+        m_stream_offset = 0;
+        m_current_index_buffer = 0;
         return D3D_OK;
     }
     virtual HRESULT CreateTexture(UINT Width, UINT Height, UINT Levels,
@@ -2509,6 +1928,7 @@ static void ApplySamplerStates(DWORD Sampler) {
         if (StreamNumber != 0) return -1; // Only stream 0 supported for now
         
         m_current_stride = Stride; // Store stride
+        m_stream_offset = OffsetInBytes;
         
         if (pStreamData) {
             D3D9VertexBuffer* vb = static_cast<D3D9VertexBuffer*>(pStreamData);
@@ -2622,11 +2042,29 @@ static void ApplySamplerStates(DWORD Sampler) {
                 if (Value) glEnable(GL_STENCIL_TEST);
                 else glDisable(GL_STENCIL_TEST);
                 break;
-            case D3DRS_STENCILFUNC: glStencilFunc(d3d_cmp_to_gl(Value), g_current_stencil_ref, 0xFFFFFFFF); break;
-            case D3DRS_STENCILREF: g_current_stencil_ref = Value; break;
-            case D3DRS_STENCILFAIL: glStencilOp(d3d_stencil_op_to_gl(Value), GL_KEEP, GL_KEEP); break;
-            case D3DRS_STENCILZFAIL: glStencilOp(GL_KEEP, d3d_stencil_op_to_gl(Value), GL_KEEP); break;
-            case D3DRS_STENCILPASS: glStencilOp(GL_KEEP, GL_KEEP, d3d_stencil_op_to_gl(Value)); break;
+            // the stencil test is set as a whole from the stored states
+            case D3DRS_STENCILFUNC: case D3DRS_STENCILREF: case D3DRS_STENCILMASK:
+                g_current_stencil_ref = m_render_states[D3DRS_STENCILREF];
+                glStencilFunc(d3d_cmp_to_gl(m_render_states[D3DRS_STENCILFUNC]), m_render_states[D3DRS_STENCILREF],
+                              m_render_states[D3DRS_STENCILMASK]);
+                break;
+            case D3DRS_STENCILFAIL: case D3DRS_STENCILZFAIL: case D3DRS_STENCILPASS:
+                glStencilOp(d3d_stencil_op_to_gl(m_render_states[D3DRS_STENCILFAIL]),
+                            d3d_stencil_op_to_gl(m_render_states[D3DRS_STENCILZFAIL]),
+                            d3d_stencil_op_to_gl(m_render_states[D3DRS_STENCILPASS]));
+                break;
+            case D3DRS_STENCILWRITEMASK: glStencilMask(Value); break;
+            case D3DRS_BLENDOP: {
+                GLenum eq = GL_FUNC_ADD;
+                switch (Value) {
+                    case 2: eq = GL_FUNC_SUBTRACT; break;          // D3DBLENDOP_SUBTRACT
+                    case 3: eq = GL_FUNC_REVERSE_SUBTRACT; break;  // D3DBLENDOP_REVSUBTRACT
+                    case 4: eq = GL_MIN; break;                    // D3DBLENDOP_MIN
+                    case 5: eq = GL_MAX; break;                    // D3DBLENDOP_MAX
+                }
+                glBlendEquation(eq);
+                break;
+            }
             
             case D3DRS_COLORWRITEENABLE:
                 glColorMask((Value & D3DCOLORWRITEENABLE_RED) ? GL_TRUE : GL_FALSE,
@@ -2672,8 +2110,8 @@ static void ApplySamplerStates(DWORD Sampler) {
         
         if (!m_current_rt) return D3D_OK;
 
-        // WebGL Y is bottom-to-top: flip Y origin
-        int gl_y = m_current_rt->m_height - pRect->bottom;
+        // WebGL Y is bottom-to-top: flip Y origin (not in upside-down render targets)
+        int gl_y = m_fbo_rendering ? (int)pRect->top : (int)(m_current_rt->m_height - pRect->bottom);
         int gl_w = pRect->right - pRect->left;
         int gl_h = pRect->bottom - pRect->top;
         glScissor(pRect->left, gl_y, gl_w, gl_h);
@@ -2811,8 +2249,9 @@ static void ApplySamplerStates(DWORD Sampler) {
 
         if (!m_current_rt) return D3D_OK;
 
-        // WebGL Y is bottom-to-top: flip Y origin
-        int gl_y = m_current_rt->m_height - (pViewport->Y + pViewport->Height);
+        // WebGL Y is bottom-to-top: flip Y origin (render targets are stored
+        // upside down already, so there D3D's Y is GL's)
+        int gl_y = m_fbo_rendering ? (int)pViewport->Y : (int)(m_current_rt->m_height - (pViewport->Y + pViewport->Height));
         glViewport(pViewport->X, gl_y, pViewport->Width, pViewport->Height);
         g_cached_viewport[0] = pViewport->X;
         g_cached_viewport[1] = gl_y;
@@ -2889,290 +2328,49 @@ static void ApplySamplerStates(DWORD Sampler) {
                                         UINT NumVertices,
                                         UINT startIndex,
                                         UINT primCount) override {
-        if (g_shader_program == 0) init_shaders();
-        glUseProgram(g_shader_program);
-
-        // FBO Y-flip and clip plane uniforms
-        glUniform1i(g_fbo_flip_y_uniform, m_fbo_rendering ? 1 : 0);
-        glUniform1i(g_clip_plane_enabled_uniform, m_clip_plane_enabled ? 1 : 0);
-        if (m_clip_plane_enabled) glUniform4fv(g_clip_plane_uniform, 1, m_clip_planes[0]);
-
-        if (m_current_vertex_buffer == 0 || m_current_index_buffer == 0) return -1;
-
-        // Calculate MVP
-        D3DMATRIX view_model, mvp;
-        if (g_current_fvf & D3DFVF_XYZRHW) {
-            float sw = (m_current_rt) ? (float)m_current_rt->m_width : (float)g_logical_width;
-            float sh = (m_current_rt) ? (float)m_current_rt->m_height : (float)g_logical_height;
-            
-            memset(&mvp, 0, sizeof(D3DMATRIX));
-            mvp.m[0][0] = 2.0f / sw;
-            mvp.m[1][1] = -2.0f / sh;
-            mvp.m[2][2] = 1.0f; 
-            mvp.m[3][0] = -1.0f;
-            mvp.m[3][1] = 1.0f;
-            mvp.m[3][3] = 1.0f;
-            
-            // 2D UI states
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glDisable(GL_DEPTH_TEST);
-            glDisable(GL_CULL_FACE);
-            glDepthMask(GL_FALSE);
-        } else {
-            matrix_multiply(&view_model, &m_world, &m_view);
-            matrix_multiply(&mvp, &view_model, &m_projection);
-        }
-
-        // Winding detection: D3D9 auto-flips culling for mirrored transforms; we emulate it
-        if (!(g_current_fvf & D3DFVF_XYZRHW)) {
-            bool mirror = (det3x3(view_model) < 0.0f);
-            glFrontFace((mirror != m_fbo_rendering) ? GL_CCW : GL_CW);
-        } else {
-            glFrontFace(GL_CW);
-        }
-
-        gl_set_matrix_uniform(g_mvp_uniform, &mvp);
-
-        // Set texture factor
-        if (g_texture_factor_uniform != -1) {
-            float r = ((m_texture_factor >> 16) & 0xFF) / 255.0f;
-            float g = ((m_texture_factor >> 8) & 0xFF) / 255.0f;
-            float b = (m_texture_factor & 0xFF) / 255.0f;
-            float a = ((m_texture_factor >> 24) & 0xFF) / 255.0f;
-            glUniform4f(g_texture_factor_uniform, r, g, b, a);
-        }
-
-        // Set mipmap LOD bias (D3D9 stores float as DWORD via type-punning).
-        // WebGL/OpenGL's LOD calculation uses a "max" rule that tends to select
-        // lower-res mip levels compared to D3D9 on the same hardware. An additional
-        // -0.75 offset compensates for this difference.
-        if (g_lod_bias_uniform != -1) {
-            DWORD bias_bits = g_sampler_states[0][D3DSAMP_MIPMAPLODBIAS];
-            float lod_bias;
-            memcpy(&lod_bias, &bias_bits, sizeof(float));
-            lod_bias -= 0.75f;
-            glUniform1f(g_lod_bias_uniform, lod_bias);
-        }
-
-        // Set Stage 0 texture stage states
-        if (g_stage0_colorop_uniform != -1) {
-            glUniform1i(g_stage0_colorop_uniform, g_texture_stage_states[0][D3DTSS_COLOROP]);
-        }
-        if (g_stage0_colorarg1_uniform != -1) {
-            glUniform1i(g_stage0_colorarg1_uniform, g_texture_stage_states[0][D3DTSS_COLORARG1]);
-        }
-        if (g_stage0_colorarg2_uniform != -1) {
-            glUniform1i(g_stage0_colorarg2_uniform, g_texture_stage_states[0][D3DTSS_COLORARG2]);
-        }
-        if (g_stage0_alphaop_uniform != -1) {
-            glUniform1i(g_stage0_alphaop_uniform, g_texture_stage_states[0][D3DTSS_ALPHAOP]);
-        }
-        if (g_stage0_alphaarg1_uniform != -1) {
-            glUniform1i(g_stage0_alphaarg1_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG1]);
-        }
-        if (g_stage0_alphaarg2_uniform != -1) {
-            glUniform1i(g_stage0_alphaarg2_uniform, g_texture_stage_states[0][D3DTSS_ALPHAARG2]);
-        }
-
-        // Fog uniforms
-        {
-            bool apply_fog = m_fog_enabled && !(g_current_fvf & D3DFVF_XYZRHW);
-            glUniform1i(g_fog_enabled_uniform, apply_fog ? 1 : 0);
-            if (apply_fog) {
-                float r = ((m_fog_color >> 16) & 0xFF) / 255.0f;
-                float g_c = ((m_fog_color >> 8) & 0xFF) / 255.0f;
-                float b = (m_fog_color & 0xFF) / 255.0f;
-                glUniform3f(g_fog_color_uniform, r, g_c, b);
-                glUniform1f(g_fog_start_uniform, m_fog_start);
-                glUniform1f(g_fog_end_uniform, m_fog_end);
-                gl_set_matrix_uniform(g_view_model_uniform, &view_model);
-            }
-        }
-
-        // Bind buffers
+        if (m_current_vertex_buffer == 0 || m_current_index_buffer == 0 || primCount == 0) return D3D_OK;
+        GLsizei count;
+        GLenum mode = FFP_Primitive(PrimitiveType, primCount, &count);
+        GLsizei stride = m_current_stride ? (GLsizei)m_current_stride : FFP_Stride(g_current_fvf);
         glBindBuffer(GL_ARRAY_BUFFER, m_current_vertex_buffer);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_current_index_buffer);
-        
-        // Dynamic FVF Parsing
-        bool has_xyz = (g_current_fvf & D3DFVF_XYZ) != 0;
-        bool has_xyzrhw = (g_current_fvf & D3DFVF_XYZRHW) != 0;
-        bool has_normal = (g_current_fvf & D3DFVF_NORMAL) != 0;
-        bool has_diffuse = (g_current_fvf & D3DFVF_DIFFUSE) != 0;
-        int tex_count = (g_current_fvf >> 8) & 0xF;
-
-        GLsizei stride = 0;
-        size_t position_offset = 0;
-        size_t normal_offset = 0;
-        size_t color_offset = 0;
-        size_t tex_offset = 0;
-
-        // XYZ and XYZRHW are mutually exclusive in D3D9 FVF
-        if (has_xyzrhw) { position_offset = stride; stride += 16; }
-        else if (has_xyz) { position_offset = stride; stride += 12; }
-        if (has_normal) { normal_offset = stride; stride += 12; }
-        if (has_diffuse) { color_offset = stride; stride += 4; }
-        tex_offset = stride;
-        stride += tex_count * 8;
-
-        // Use stored stride if valid
-        if (m_current_stride > 0) stride = m_current_stride;
-
-        // BaseVertexIndex support
-        size_t base_offset = BaseVertexIndex * stride;
-
-        // Enable/Set Pointers with safety guards
-        if ((has_xyz || has_xyzrhw) && g_position_location != -1) {
-            glEnableVertexAttribArray(g_position_location);
-            GLint pos_component_count = has_xyzrhw ? 4 : 3;
-            glVertexAttribPointer(g_position_location, pos_component_count, GL_FLOAT, GL_FALSE, stride, (void*)(base_offset + position_offset));
-        }
-
-        // D3D9 FFP Lighting
-        bool lighting_enabled = has_normal && !has_xyzrhw && m_render_states[D3DRS_LIGHTING];
-        if (lighting_enabled) {
-            // Normal attribute
-            if (g_normal_location != -1) {
-                glEnableVertexAttribArray(g_normal_location);
-                glVertexAttribPointer(g_normal_location, 3, GL_FLOAT, GL_FALSE, stride, (void*)(base_offset + normal_offset));
+        FFP_SetupAttribs(g_current_fvf, m_stream_offset + (size_t)((ptrdiff_t)BaseVertexIndex * stride), stride);
+#ifdef DEBUG_TEXTURE_TEST
+        if (g_dbg_frame == 200 && g_current_fvf == 0x112) {
+            D3DMATRIX wv, wvp; FFP_Mul(&wv, &m_world, &m_view); FFP_Mul(&wvp, &wv, &m_projection);
+            const float* M[3] = {&m_world.m[0][0], &m_view.m[0][0], &m_projection.m[0][0]};
+            for (int k = 0; k < 3; k++) { printf("[mat%d]", k); for (int i = 0; i < 16; i++) printf(" %.3g", M[k][i]); printf("\n"); }
+            {
+                std::vector<float> all(NumVertices * 8);
+                glGetBufferSubData(GL_ARRAY_BUFFER, m_stream_offset + BaseVertexIndex * stride, NumVertices * 32, all.data());
+                unsigned inside = 0, front = 0;
+                float mn[2] = {1e9f, 1e9f}, mx[2] = {-1e9f, -1e9f};
+                for (UINT i = 0; i < NumVertices; i++) {
+                    const float* v = &all[i * 8];
+                    float c[4];
+                    for (int j = 0; j < 4; j++) c[j] = v[0] * wvp.m[0][j] + v[1] * wvp.m[1][j] + v[2] * wvp.m[2][j] + wvp.m[3][j];
+                    if (c[3] <= 0) continue;
+                    front++;
+                    float x = c[0] / c[3], y = c[1] / c[3];
+                    if (x < mn[0]) mn[0] = x; if (x > mx[0]) mx[0] = x; if (y < mn[1]) mn[1] = y; if (y > mx[1]) mx[1] = y;
+                    if (fabsf(x) <= 1 && fabsf(y) <= 1 && c[2] >= 0 && c[2] <= c[3]) inside++;
+                }
+                printf("[geo] %u verts, %u in front, %u inside; ndc x %g..%g y %g..%g\n", NumVertices, front, inside, mn[0], mx[0], mn[1], mx[1]);
             }
-
-            glUniform1i(g_lighting_enabled_uniform, 1);
-            SetFFPLightingUniforms(&m_world, m_render_states);
-
-            glDisableVertexAttribArray(g_color_location);
-            glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f);
-        } else {
-            glUniform1i(g_lighting_enabled_uniform, 0);
-            // Always set world matrix for clip plane (v_position_world) even without lighting
-            gl_set_matrix_uniform(g_world_uniform, &m_world);
-            if (g_normal_location != -1) {
-                glDisableVertexAttribArray(g_normal_location);
-            }
-
-            if (has_diffuse && g_color_location != -1) {
-                glEnableVertexAttribArray(g_color_location);
-                glVertexAttribPointer(g_color_location, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void*)(base_offset + color_offset));
-            } else if (g_color_location != -1) {
-                glDisableVertexAttribArray(g_color_location);
-                glVertexAttrib4f(g_color_location, 1.0f, 1.0f, 1.0f, 1.0f);
+            unsigned short idx[3];
+            glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, startIndex * 2, 6, idx);
+            for (int k = 0; k < 3; k++) {
+                float v[8];
+                glGetBufferSubData(GL_ARRAY_BUFFER, m_stream_offset + (BaseVertexIndex + idx[k]) * stride, 32, v);
+                float c[4];
+                for (int j = 0; j < 4; j++) c[j] = v[0] * wvp.m[0][j] + v[1] * wvp.m[1][j] + v[2] * wvp.m[2][j] + wvp.m[3][j];
+                printf("[geo] v %g %g %g clip %g %g %g %g ndc %g %g %g\n", v[0], v[1], v[2], c[0], c[1], c[2], c[3], c[0]/c[3], c[1]/c[3], c[2]/c[3]);
             }
         }
-
-        if (tex_count > 0 && g_texcoord_location != -1) {
-            glEnableVertexAttribArray(g_texcoord_location);
-            glVertexAttribPointer(g_texcoord_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)(base_offset + tex_offset));
-        } else if (g_texcoord_location != -1) {
-            glDisableVertexAttribArray(g_texcoord_location);
-            glVertexAttrib2f(g_texcoord_location, 0.0f, 0.0f);
-        }
-
-        if (tex_count > 1 && g_texcoord1_location != -1) {
-            glEnableVertexAttribArray(g_texcoord1_location);
-            glVertexAttribPointer(g_texcoord1_location, 2, GL_FLOAT, GL_FALSE, stride, (void*)(base_offset + tex_offset + 8));
-        } else if (g_texcoord1_location != -1) {
-            glDisableVertexAttribArray(g_texcoord1_location);
-            glVertexAttrib2f(g_texcoord1_location, 0.0f, 0.0f);
-        }
-        
-        // Texture setup
-        if (g_texture_stages[0] != 0 && tex_count > 0) {
-            glActiveTexture(GL_TEXTURE0);
-            
-            // Optimization: Avoid redundant texture binding
-            if (g_last_bound_texture_id != g_texture_stages[0]) {
-                glBindTexture(GL_TEXTURE_2D, g_texture_stages[0]);
-                g_last_bound_texture_id = g_texture_stages[0];
-            }
-            
-            // Apply cached sampler states
-            ApplySamplerStates(0);
-
-            glUniform1i(g_texture_uniform, 0);
-            glUniform1i(g_use_texture_uniform, 1);
-
-            // Texture transform
-            if (g_texture_stage_states[0][D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) {
-                // D3D row-major matrices. Shader does u_tex_matrix * vec4(uv, 0, 1).
-                // We need to pass the matrix correctly.
-                glUniformMatrix4fv(g_tex_matrix_uniform, 1, GL_FALSE, &g_texture_matrices[0].m[0][0]);
-                glUniform1i(g_use_tex_matrix_uniform, 1);
-            } else {
-                glUniform1i(g_use_tex_matrix_uniform, 0);
-            }
-        } else {
-            glUniform1i(g_use_texture_uniform, 0);
-            glUniform1i(g_use_tex_matrix_uniform, 0);
-        }
-
-        // Lightmap setup (Stage 1) - requires at least 2 texture coordinate sets
-        if (g_texture_stages[1] != 0 && tex_count > 1) {
-            glActiveTexture(GL_TEXTURE1);
-            if (g_last_bound_lightmap_id != g_texture_stages[1]) {
-                glBindTexture(GL_TEXTURE_2D, g_texture_stages[1]);
-                g_last_bound_lightmap_id = g_texture_stages[1];
-            }
-
-            // Apply sampler states for Stage 1 (reuse shared logic for mipmap awareness)
-            ApplySamplerStates(1);
-
-            glUniform1i(g_texture_lm_uniform, 1);
-            glUniform1i(g_use_lightmap_uniform, 1);
-
-            // Apply texture stage operation mode
-            DWORD op = g_texture_stage_states[1][D3DTSS_COLOROP];
-            glUniform1i(g_stage1_op_uniform, op);
-
-            // Restore active texture unit to TEXTURE0 so subsequent draw calls
-            // (e.g., DrawIndexedPrimitiveUP/DrawPrimitiveUP) don't accidentally
-            // operate on GL_TEXTURE1 when they assume TEXTURE0 is active.
-            glActiveTexture(GL_TEXTURE0);
-        } else {
-            glUniform1i(g_use_lightmap_uniform, 0);
-        }
-
-        glUniform1i(g_alpha_test_enabled_uniform, m_alpha_test_enabled ? 1 : 0);
-        glUniform1f(g_alpha_ref_uniform, (float)m_alpha_ref);
-
-        // Draw
-        GLenum gl_primitive_type = GL_TRIANGLES;
-        UINT index_count = 0;
-        switch (PrimitiveType) {
-            case D3DPT_TRIANGLELIST: gl_primitive_type = GL_TRIANGLES; index_count = primCount * 3; break;
-            case D3DPT_TRIANGLESTRIP: gl_primitive_type = GL_TRIANGLE_STRIP; index_count = primCount + 2; break;
-            case D3DPT_TRIANGLEFAN: gl_primitive_type = GL_TRIANGLE_FAN; index_count = primCount + 2; break;
-            case D3DPT_LINELIST: gl_primitive_type = GL_LINES; index_count = primCount * 2; break;
-            case D3DPT_LINESTRIP: gl_primitive_type = GL_LINE_STRIP; index_count = primCount + 1; break;
-            case D3DPT_POINTLIST: gl_primitive_type = GL_POINTS; index_count = primCount; break;
-        }
-
-        // Offset in index buffer (respects 16-bit vs 32-bit index format)
-        bool is_index32 = (m_current_ib_format == D3DFMT_INDEX32);
-        GLenum gl_index_type = is_index32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
-        size_t index_stride = is_index32 ? 4 : 2;
-        void* indices = (void*)(uintptr_t)(startIndex * index_stride);
-
-        glDrawElements(gl_primitive_type, index_count, gl_index_type, indices);
-
-        glDisableVertexAttribArray(g_position_location);
-        glDisableVertexAttribArray(g_color_location);
-        glDisableVertexAttribArray(g_texcoord_location);
-        glDisableVertexAttribArray(g_texcoord1_location);
-        if (g_normal_location != -1) glDisableVertexAttribArray(g_normal_location);
-
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-
-        // Restore GL states if XYZRHW path overrode them
-        if (g_current_fvf & D3DFVF_XYZRHW) {
-            if (m_render_states[D3DRS_ZENABLE]) glEnable(GL_DEPTH_TEST);
-            if (m_render_states[D3DRS_ZWRITEENABLE]) glDepthMask(GL_TRUE);
-            if (m_render_states[D3DRS_CULLMODE] != D3DCULL_NONE) glEnable(GL_CULL_FACE);
-            // Restore blend state from tracked render states
-            if (!m_render_states[D3DRS_ALPHABLENDENABLE]) glDisable(GL_BLEND);
-            else { glEnable(GL_BLEND); glBlendFunc(m_src_blend, m_dst_blend); }
-        }
-
+#endif
+        PrepareDraw();
+        bool i32 = m_current_ib_format == D3DFMT_INDEX32;
+        glDrawElements(mode, count, i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, (void*)(uintptr_t)(startIndex * (i32 ? 4 : 2)));
         return D3D_OK;
     }
 
