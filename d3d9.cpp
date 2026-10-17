@@ -217,19 +217,6 @@ static D3DMATRIX g_transform_projection;
 
 
 
-// Helper: Matrix multiplication
-static void matrix_multiply(D3DMATRIX* result, const D3DMATRIX* a, const D3DMATRIX* b) {
-    D3DMATRIX temp;
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            temp.m[i][j] = 0;
-            for (int k = 0; k < 4; k++) {
-                temp.m[i][j] += a->m[i][k] * b->m[k][j];
-            }
-        }
-    }
-    *result = temp;
-}
 
 static void matrix_identity(D3DMATRIX* m) {
     memset(m, 0, sizeof(D3DMATRIX));
@@ -722,15 +709,8 @@ private:
     // State Tracking
     GLenum m_src_blend = GL_ONE;
     GLenum m_dst_blend = GL_ZERO;
-    DWORD m_alpha_ref = 0;
-    bool m_alpha_test_enabled = false;
-    D3DCOLOR m_texture_factor;
 
     // Fog state
-    bool m_fog_enabled = false;
-    float m_fog_start = 0.0f;
-    float m_fog_end = 1.0f;
-    D3DCOLOR m_fog_color = 0xFFFFFFFF;
 
     // Debug: Flags to suppress repetitive shader warnings (performance optimization)
     static bool s_pixel_shader_warning_shown;
@@ -739,7 +719,7 @@ private:
     RECT m_scissor_rect = {};
 
 public:
-    D3D9Device() : m_current_index_buffer(0), m_current_ib_format(D3DFMT_INDEX16), m_current_vertex_buffer(0), m_current_stride(0), m_texture_factor(0xFFFFFFFF) {
+    D3D9Device() : m_current_index_buffer(0), m_current_ib_format(D3DFMT_INDEX16), m_current_vertex_buffer(0), m_current_stride(0) {
         
         g_viewport.X = 0;
         g_viewport.Y = 0;
@@ -794,8 +774,6 @@ public:
         }
 
         // Initialize state
-        m_alpha_ref = 0;
-        m_alpha_test_enabled = false;
         m_src_blend = GL_ONE;
         m_dst_blend = GL_ZERO;
 
@@ -930,15 +908,6 @@ public:
         // is stored upside down, which turns them counter-clockwise
         glFrontFace(m_fbo_rendering ? GL_CCW : GL_CW);
         FFP_Prepare(c, (float)g_viewport.X, (float)g_viewport.Y, (float)g_viewport.Width, (float)g_viewport.Height);
-    }
-
-    // The texture a stage may sample: none while it is also the render target.
-    // (D3D9 leaves that undefined and drivers tolerate it; WebGL refuses the draw
-    // with "Feedback loop formed between Framebuffer and active Texture".)
-    GLuint SamplableTexture(DWORD stage) const {
-        GLuint t = g_texture_stages[stage];
-        if (t && m_fbo_rendering && m_current_rt && t == m_current_rt->m_gl_object) return 0;
-        return t;
     }
 
     virtual HRESULT GetBackBuffer(UINT iSwapChain, UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface9** ppBackBuffer) override {
@@ -1451,14 +1420,6 @@ static void ApplySamplerStates(DWORD Sampler) {
                 glDepthFunc(d3d_cmp_to_gl(Value));
                 break;
 
-            case D3DRS_ALPHATESTENABLE:
-                m_alpha_test_enabled = (Value != 0);
-                break;
-
-            case D3DRS_ALPHAREF:
-                m_alpha_ref = Value;
-                break;
-
             case D3DRS_SCISSORTESTENABLE:
                 if (Value) {
                     glEnable(GL_SCISSOR_TEST);
@@ -1503,33 +1464,9 @@ static void ApplySamplerStates(DWORD Sampler) {
                            (Value & D3DCOLORWRITEENABLE_BLUE) ? GL_TRUE : GL_FALSE,
                            (Value & D3DCOLORWRITEENABLE_ALPHA) ? GL_TRUE : GL_FALSE);
                 break;
-            case D3DRS_TEXTUREFACTOR:
-                m_texture_factor = Value;
-                break;
-
-            case D3DRS_FOGENABLE:
-                m_fog_enabled = (Value != 0);
-                break;
-            case D3DRS_FOGCOLOR:
-                m_fog_color = Value;
-                break;
-            case D3DRS_FOGSTART:
-                m_fog_start = *(float*)&Value;
-                break;
-            case D3DRS_FOGEND:
-                m_fog_end = *(float*)&Value;
-                break;
-            case D3DRS_FOGTABLEMODE:
-                // Only D3DFOG_LINEAR is implemented. D3DFOG_EXP and D3DFOG_EXP2 are not supported.
-                // TODO: implement EXP/EXP2 fog modes if needed.
-                break;
-            case D3DRS_FOGVERTEXMODE:
-                // Vertex fog mode is ignored; table fog (per-pixel) is always used.
-                // TODO: implement vertex fog mode if needed.
-                break;
-            case D3DRS_RANGEFOGENABLE:
-                // Range-based fog is not implemented; depth (eye-space Z) is used instead.
-                // TODO: implement range-based fog if needed.
+            default:
+                // lighting, texture factor, alpha test, fog etc. are read from
+                // m_render_states by the fixed-function pipeline at draw time
                 break;
         }
         return D3D_OK;

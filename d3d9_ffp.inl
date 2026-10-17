@@ -56,6 +56,7 @@ struct FFPKey {
     uint8_t light_type[FFP_MAX_LIGHTS];  // 0 off, D3DLIGHT_POINT/SPOT/DIRECTIONAL
     uint8_t fog;                    // 0 none, D3DFOG_EXP/EXP2/LINEAR, 4 = specular alpha
     uint8_t fog_range;
+    uint8_t fog_table;              // table fog: computed per pixel from the eye depth
     uint8_t alpha_func;             // 0 = no alpha test
     uint8_t clip;
     uint8_t stage_count;
@@ -163,6 +164,13 @@ static bool FFP_StageSamples(const FFPStageKey& s) {
         s.alphaop == D3DTOP_BLENDTEXTUREALPHA || s.alphaop == D3DTOP_BLENDTEXTUREALPHAPM);
 }
 
+static std::string FFP_FogFactor(int mode, const char* d) {
+    std::string x = d;
+    if (mode == D3DFOG_LINEAR) return "clamp((u_fog.y - " + x + ") / max(u_fog.y - u_fog.x, 1e-20), 0.0, 1.0)";
+    if (mode == D3DFOG_EXP) return "clamp(exp(-u_fog.z * " + x + "), 0.0, 1.0)";
+    return "clamp(exp(-(u_fog.z * " + x + ") * (u_fog.z * " + x + ")), 0.0, 1.0)";
+}
+
 static std::string FFP_GenVS(const FFPKey& k) {
     std::string s = "#version 300 es\nprecision highp float;\n";
     s += "layout(location=0) in vec4 a_pos;\nlayout(location=1) in vec3 a_normal;\n"
@@ -263,14 +271,13 @@ static std::string FFP_GenVS(const FFPKey& k) {
                  " v_tc" + n + " = vec4(r.x / m + 0.5, -r.y / m + 0.5, 0.0, 1.0); }\n";
     }
 
-    // fog factor (1 = no fog)
+    // fog: the factor (1 = no fog), or for table fog the eye depth it is computed from per pixel
     s += "  v_fog = 1.0;\n";
     if (k.fog == 4) s += "  v_fog = v_specular.a;\n";
+    else if (k.fog_table) s += "  v_fog = abs(P.z);\n";
     else if (k.fog) {
         s += k.fog_range ? "  float fd = length(P);\n" : "  float fd = abs(P.z);\n";
-        if (k.fog == D3DFOG_LINEAR) s += "  v_fog = clamp((u_fog.y - fd) / max(u_fog.y - u_fog.x, 1e-20), 0.0, 1.0);\n";
-        else if (k.fog == D3DFOG_EXP) s += "  v_fog = clamp(exp(-u_fog.z * fd), 0.0, 1.0);\n";
-        else s += "  v_fog = clamp(exp(-(u_fog.z * fd) * (u_fog.z * fd)), 0.0, 1.0);\n";
+        s += std::string("  v_fog = ") + FFP_FogFactor(k.fog, "fd") + ";\n";
     }
     s += "  v_clipdist = 1.0;\n";
     if (k.clip && !k.rhw) s += "  v_clipdist = dot(u_world * vec4(a_pos.xyz, 1.0), u_clipplane);\n";
@@ -329,7 +336,7 @@ static std::string FFP_Op(int op, const std::string& a0, const std::string& a1, 
 static std::string FFP_GenFS(const FFPKey& k) {
     std::string s = "#version 300 es\nprecision highp float;\n";
     s += "in vec4 v_diffuse, v_specular;\nin float v_fog, v_clipdist;\n"
-         "uniform vec4 u_tfactor;\nuniform float u_alpharef;\nuniform vec3 u_fogcolor;\n"
+         "uniform vec4 u_tfactor;\nuniform float u_alpharef;\nuniform vec3 u_fogcolor;\nuniform vec4 u_fog;\n"
          "out vec4 o_color;\n";
     for (int i = 0; i < k.stage_count; i++) {
         s += "in vec4 v_tc" + FFP_Itos(i) + ";\n";
@@ -375,7 +382,8 @@ static std::string FFP_GenFS(const FFPKey& k) {
         s += "  " + dst + " = clamp(vec4(" + col + ", " + alp + "), 0.0, 1.0);\n";
     }
     if (k.specular) s += "  cur.rgb = clamp(cur.rgb + v_specular.rgb, 0.0, 1.0);\n";
-    if (k.fog) s += "  cur.rgb = mix(u_fogcolor, cur.rgb, v_fog);\n";
+    if (k.fog_table) s += "  cur.rgb = mix(u_fogcolor, cur.rgb, " + FFP_FogFactor(k.fog, "v_fog") + ");\n";
+    else if (k.fog) s += "  cur.rgb = mix(u_fogcolor, cur.rgb, v_fog);\n";
     if (k.alpha_func && k.alpha_func != D3DCMP_ALWAYS) {
         // compare in the 0..255 steps of D3DRS_ALPHAREF
         const char* cmp = "";
@@ -555,7 +563,7 @@ static void FFP_BuildKey(const FFPDrawContext& c, FFPKey& k, GLuint* stage_tex) 
 
     if (rs[D3DRS_FOGENABLE]) {
         DWORD table = rs[D3DRS_FOGTABLEMODE], vert = rs[D3DRS_FOGVERTEXMODE];
-        if (table != D3DFOG_NONE && !k.rhw) k.fog = (uint8_t)table;
+        if (table != D3DFOG_NONE && !k.rhw) { k.fog = (uint8_t)table; k.fog_table = 1; }
         else if (vert != D3DFOG_NONE && !k.rhw) { k.fog = (uint8_t)vert; k.fog_range = rs[D3DRS_RANGEFOGENABLE] != 0; }
         else k.fog = 4; // fog factor from the specular alpha
     }
