@@ -341,7 +341,6 @@ static std::string FFP_GenFS(const FFPKey& k) {
     for (int i = 0; i < k.stage_count; i++) {
         const FFPStageKey& st = k.stage[i];
         std::string n = FFP_Itos(i), tc = "v_tc" + n;
-        // a stage without a texture reads its TEXTURE argument as opaque white
         if (FFP_StageSamples(st)) {
             std::string uv = tc + ".xy";
             if (st.projected) {
@@ -353,15 +352,23 @@ static std::string FFP_GenFS(const FFPKey& k) {
             s += "  vec4 t" + n + " = vec4(1.0);\n";
         }
         std::string col = "cur.rgb", alp = "cur.a";
-        if (st.colorop != D3DTOP_DISABLE) {
+        // like D3D9 (and wined3d): an operation that takes the texture of a
+        // stage without one passes the current value on unchanged
+        auto uses = [](int a0, int a1, int a2, int op) {
+            return (a0 & 15) == D3DTA_TEXTURE || (a1 & 15) == D3DTA_TEXTURE || (a2 & 15) == D3DTA_TEXTURE ||
+                   op == D3DTOP_BLENDTEXTUREALPHA || op == D3DTOP_BLENDTEXTUREALPHAPM;
+        };
+        bool col_off = !st.has_texture && uses(st.carg0, st.carg1, st.carg2, st.colorop);
+        bool alp_off = !st.has_texture && uses(st.aarg0, st.aarg1, st.aarg2, st.alphaop);
+        if (st.colorop != D3DTOP_DISABLE && !col_off) {
             if (st.colorop == D3DTOP_DOTPRODUCT3)
                 col = "vec3(clamp(dot((" + FFP_Arg(st.carg1, i, false) + " - 0.5) * 2.0, (" + FFP_Arg(st.carg2, i, false) + " - 0.5) * 2.0), 0.0, 1.0))";
             else
                 col = FFP_Op(st.colorop, FFP_Arg(st.carg0, i, false), FFP_Arg(st.carg1, i, false), FFP_Arg(st.carg2, i, false),
                              i, false, FFP_Arg(st.carg1, i, true));
         }
-        if (st.colorop == D3DTOP_DOTPRODUCT3) alp = col + ".r"; // replicated to alpha
-        else if (st.alphaop != D3DTOP_DISABLE)
+        if (st.colorop == D3DTOP_DOTPRODUCT3 && !col_off) alp = col + ".r"; // replicated to alpha
+        else if (st.alphaop != D3DTOP_DISABLE && !alp_off)
             alp = FFP_Op(st.alphaop, FFP_Arg(st.aarg0, i, true), FFP_Arg(st.aarg1, i, true), FFP_Arg(st.aarg2, i, true),
                          i, true, FFP_Arg(st.aarg1, i, true));
         std::string dst = st.result_temp ? "tmp" : "cur";

@@ -749,6 +749,8 @@ static inline bool getenv_nolight() {
 }
 #ifdef DEBUG_TEXTURE_TEST
 static int g_dbg_frame = 0;
+static int g_dbg_target = 200;
+extern "C" void d3d9_debug_next_frame() { g_dbg_target = g_dbg_frame + 1; }
 EM_JS(void, glGetBufferSubData, (GLenum target, long offset, long size, void* data), {
     GLctx.getBufferSubData(target, offset, HEAPU8.subarray(data, data + size));
 });
@@ -1420,6 +1422,20 @@ public:
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rb);
     }
 
+#ifdef DEBUG_TEXTURE_TEST
+    void DbgReadTarget(const char* what) {
+        if (!m_current_rt) return;
+        UINT w = m_current_rt->m_width, h = m_current_rt->m_height;
+        std::vector<unsigned char> px(w * h * 4);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        double ch[4] = {0, 0, 0, 0};
+        for (UINT i = 0; i < w * h; i++) for (int c = 0; c < 4; c++) ch[c] += px[i*4+c];
+        // corner pixel (background) and mean
+        printf("[draw] %s rt %u: mean %.0f %.0f %.0f %.0f corner %d %d %d %d\n", what, m_current_rt->m_gl_object,
+            ch[0]/(w*h), ch[1]/(w*h), ch[2]/(w*h), ch[3]/(w*h), px[0], px[1], px[2], px[3]);
+    }
+#endif
+
     // Everything a draw needs before glDraw*: program, uniforms, textures, winding
     void PrepareDraw() {
         FFPDrawContext c;
@@ -1443,7 +1459,7 @@ public:
 #endif
         FFP_Prepare(c, (float)g_viewport.X, (float)g_viewport.Y, (float)g_viewport.Width, (float)g_viewport.Height);
 #ifdef DEBUG_TEXTURE_TEST
-        if (g_dbg_frame == 200) {
+        if (g_dbg_frame == g_dbg_target) {
             FFPKey k; GLuint st[4];
             FFP_BuildKey(c, k, st);
             printf("[ffp] rt %u fvf %x light %d spec %d src %d%d%d%d lights %d%d%d%d stages %d fog %d atest %d | blend %u %u/%u z %u/%u cull %u\n",
@@ -1534,7 +1550,7 @@ public:
 
         D3D9Surface* surf = static_cast<D3D9Surface*>(pRenderTarget);
 #ifdef DEBUG_TEXTURE_TEST
-        if (g_dbg_frame == 200 && m_fbo_rendering && m_current_rt) {
+        if (g_dbg_frame == g_dbg_target && m_fbo_rendering && m_current_rt) {
             UINT w = m_current_rt->m_width, h = m_current_rt->m_height;
             std::vector<unsigned char> px(w * h * 4);
             glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -1633,6 +1649,9 @@ public:
         FFP_SetupAttribs(g_current_fvf, m_stream_offset, stride);
         PrepareDraw();
         glDrawArrays(mode, StartVertex, count);
+#ifdef DEBUG_TEXTURE_TEST
+        if (g_dbg_frame == g_dbg_target) DbgReadTarget("after drawarrays");
+#endif
         return D3D_OK;
     }
     
@@ -2336,7 +2355,7 @@ static void ApplySamplerStates(DWORD Sampler) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_current_index_buffer);
         FFP_SetupAttribs(g_current_fvf, m_stream_offset + (size_t)((ptrdiff_t)BaseVertexIndex * stride), stride);
 #ifdef DEBUG_TEXTURE_TEST
-        if (g_dbg_frame == 200 && g_current_fvf == 0x112) {
+        if (g_dbg_frame == g_dbg_target && g_current_fvf == 0x112) {
             D3DMATRIX wv, wvp; FFP_Mul(&wv, &m_world, &m_view); FFP_Mul(&wvp, &wv, &m_projection);
             const float* M[3] = {&m_world.m[0][0], &m_view.m[0][0], &m_projection.m[0][0]};
             for (int k = 0; k < 3; k++) { printf("[mat%d]", k); for (int i = 0; i < 16; i++) printf(" %.3g", M[k][i]); printf("\n"); }
@@ -2371,6 +2390,9 @@ static void ApplySamplerStates(DWORD Sampler) {
         PrepareDraw();
         bool i32 = m_current_ib_format == D3DFMT_INDEX32;
         glDrawElements(mode, count, i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, (void*)(uintptr_t)(startIndex * (i32 ? 4 : 2)));
+#ifdef DEBUG_TEXTURE_TEST
+        if (g_dbg_frame == g_dbg_target) DbgReadTarget("after draw");
+#endif
         return D3D_OK;
     }
 
